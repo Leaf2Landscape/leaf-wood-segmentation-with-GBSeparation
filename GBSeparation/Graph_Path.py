@@ -28,6 +28,7 @@ __status__ = "Development"
 import networkx as nx
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
+from tqdm import tqdm
 def array_to_graph(arr, base_id, kpairs=3, knn=300, nbrs_threshold=0.1,
                    nbrs_threshold_step=0.02, graph_threshold=np.inf):
 
@@ -96,6 +97,7 @@ def array_to_graph(arr, base_id, kpairs=3, knn=300, nbrs_threshold=0.1,
     # Looping while there are still indices (idx) left to process.
     k=1
     previous_test = 0
+    pbar = tqdm(total=arr.shape[0], desc="Processing points")
     while (unprocessed_idx.shape[0] > 0):
         k=k+1
         test = unprocessed_idx.shape[0]
@@ -195,7 +197,9 @@ def array_to_graph(arr, base_id, kpairs=3, knn=300, nbrs_threshold=0.1,
         # Generating list of remaining proints to process.
         unprocessed_idx = idx_base[np.in1d(idx_base, processed_idx, invert=True)]
 
-        print("unprocessed_count:", unprocessed_idx.shape[0])
+        pbar.update(len(current_idx))
+    
+    pbar.close()
 
     return G
 
