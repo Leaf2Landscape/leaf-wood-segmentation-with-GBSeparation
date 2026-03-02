@@ -10,9 +10,9 @@ import os
 import laspy
 
 # the input files path
-pathin = "C:/Users/lmterryn/GBS_test/in/" #change to your input folder 
+pathin = "/home/capheus/projects/AMAPVox_test/second_test/leafWoodSep/unlabelled/" #change to your input folder 
 # the output files path
-outpath = "C:/Users/lmterryn/GBS_test/out/"  #change to your output folder
+outpath = "/home/capheus/projects/AMAPVox_test/second_test/leafWoodSep/labelled/"  #change to your output folder
 
 # the columns of x,y,z coordinates in the input point cloud file, change to your own if needed.
 xyz_cols = [0, 1, 2]
