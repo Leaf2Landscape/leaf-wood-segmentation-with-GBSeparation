@@ -14,6 +14,9 @@ pathin = "C:/Users/lmterryn/GBS_test/in/" #change to your input folder
 # the output files path
 outpath = "C:/Users/lmterryn/GBS_test/out/"  #change to your output folder
 
+# the columns of x,y,z coordinates in the input point cloud file, change to your own if needed.
+xyz_cols = [0, 1, 2]
+
 files = os.listdir(pathin)
 
 for i in range(0, len(files)):
@@ -22,9 +25,8 @@ for i in range(0, len(files)):
     format_pc = filename.split('.')[-1]
 
     # load single tree point cloud.
-    if format_pc == 'txt':
-        pcd = o3d.io.read_point_cloud(pathin + filename, format = 'xyz')
-        pcd = np.asarray(pcd.points)
+    if format_pc == 'txt' or format_pc == 'xyz':
+        pcd = np.loadtxt(pathin + filename, usecols=xyz_cols, dtype=np.float32)
     elif format_pc == 'las':
         pcd = laspy.read(pathin + filename)
         pcd = np.vstack((pcd.x, pcd.y, pcd.z)).transpose()

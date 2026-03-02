@@ -1,0 +1,14 @@
+name: GBSeparation
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python==3.9
+  - numpy
+  - laspy
+  - scikit-learn
+  - networkx
+  - numba
+  - pip
+  - pip:
+    - open3d
