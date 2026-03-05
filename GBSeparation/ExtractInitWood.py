@@ -128,7 +128,7 @@ def extract_init_wood(
     max_angle=np.pi,
     t_linearity=0.9,
     t_error=0.2,
-    min_component_size: int = 2,
+    min_component_size: int = 1,
     classify_parallel: bool = True,
     max_workers: int = None,
     verbose: bool = True,
