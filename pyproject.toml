@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "GBSeparation"
+version = "0.1.0"
+description = "Graph-Based leaf-wood separation for single tree point clouds"
+readme = "README.md"
+requires-python = ">=3.7"
+license = {text = "GPL-3.0"}
+dependencies = [
+    "numpy",
+    "scikit-learn",
+    "networkx",
+    "numba",
+]
+
+[project.optional-dependencies]
+io = ["laspy", "open3d"]
+viz = ["open3d", "matplotlib"]
+all = ["laspy", "open3d", "matplotlib"]
+
+[project.scripts]
+gbseparation = "GBSeparation.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["GBSeparation*"]
