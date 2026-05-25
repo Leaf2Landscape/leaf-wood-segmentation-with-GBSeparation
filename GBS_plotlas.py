@@ -63,34 +63,39 @@ def build_groups(las):
 
 
 def _make_output_header(las, overwrite):
-    """Build output LasHeader with leaf_wood (int8) extra dim."""
+    """Build output LasHeader with foliage_type (int8) extra dim."""
     dim_names = [dim.name for dim in las.point_format.dimensions]
-    if 'leaf_wood' in dim_names and not overwrite:
-        print("Error: 'leaf_wood' dimension already exists. Use --overwrite to replace it.")
+    if 'foliage_type' in dim_names and not overwrite:
+        print("Error: 'foliage_type' dimension already exists. Use --overwrite to replace it.")
         sys.exit(1)
+
+    existing_extra = [
+        laspy.ExtraBytesParams(name=d.name, type=d.type)
+        for d in las.point_format.extra_dims
+        if d.name != 'foliage_type'
+    ]
+    existing_extra.append(laspy.ExtraBytesParams(
+        name="foliage_type", type=np.int8,
+        description="1=leaf, 0=wood, -1=other/ground/failed"))
 
     new_header = laspy.LasHeader(
         point_format=las.header.point_format,
         version=las.header.version,
+        extra_dims=existing_extra,
     )
     new_header.offsets = las.header.offsets
     new_header.scales = las.header.scales
-    extra_dims = [d for d in las.header.extra_dims if d.name != 'leaf_wood']
-    extra_dims.append(laspy.ExtraBytesParams(
-        name="leaf_wood", type=np.int8,
-        description="1=leaf, 0=wood, -1=other/ground/failed"))
-    new_header.extra_dims = extra_dims
     return new_header
 
 
 def _write_chunk(writer, src_points, src_fmt, indices, lw_values, out_fmt):
-    """Write a subset of source points with leaf_wood values to a LasWriter."""
+    """Write a subset of source points with foliage_type values to a LasWriter."""
     sub = src_points[indices]
     buf = np.zeros(len(indices), dtype=out_fmt.dtype)
     for name in src_fmt.dimension_names:
         if name in buf.dtype.names:
             buf[name] = sub[name]
-    buf['leaf_wood'] = lw_values
+    buf['foliage_type'] = lw_values
     writer.write_points(laspy.PackedPointRecord(buf, out_fmt))
 
 
@@ -118,8 +123,8 @@ def _gbs_worker(args):
                                              init_wood_ids, G)
         final_wood_mask[-1] = False
         # pipeline: True=wood; output: 1=leaf, 0=wood
-        leaf_wood = (~final_wood_mask[:-1]).astype(_LW_DTYPE)
-        return task_id, global_indices, leaf_wood
+        foliage_type = (~final_wood_mask[:-1]).astype(_LW_DTYPE)
+        return task_id, global_indices, foliage_type
     except Exception as exc:
         print("Warning: component failed (%d points): %s" % (len(global_indices), exc))
         return task_id, global_indices, np.full(len(global_indices), SENTINEL, dtype=_LW_DTYPE)
@@ -158,7 +163,7 @@ def main():
     parser.add_argument("--workers", type=int, default=min(os.cpu_count() or 4, 8),
                         help="number of parallel processes (default: min(cpu_count, 8))")
     parser.add_argument("--overwrite", action="store_true",
-                        help="overwrite the 'leaf_wood' dimension if it already exists in the input")
+                        help="overwrite the 'foliage_type' dimension if it already exists in the input")
     args = parser.parse_args()
 
     if not os.path.isfile(args.input_file):
