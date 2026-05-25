@@ -5,3 +5,8 @@ CLAUDE.md
 # Python
 __pycache__/
 *.pyc
+GBSeparation/__pycache__/Accuracy_evaluation.cpython-39.pyc
+GBSeparation/__pycache__/Components_classify.cpython-39.pyc
+GBSeparation/__pycache__/ExtractFinalWood.cpython-39.pyc
+GBSeparation/__pycache__/ExtractInitWood.cpython-39.pyc
+GBSeparation/__pycache__/Graph_Path.cpython-39.pyc
