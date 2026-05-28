@@ -1,7 +1,6 @@
 import os
 import sys
 import argparse
-import multiprocessing as mp
 import numpy as np
 import laspy
 from tqdm import tqdm
@@ -14,7 +13,7 @@ GROUND_CLASS = 2
 _LW_DTYPE = np.int8   # 1=leaf, 0=wood, -1=other/ground/failed
 SENTINEL = np.int8(-1)
 MIN_COMPONENT_POINTS = 10
-_MAX_POOL_RETRIES = 5
+_WRITE_CHUNK = 100_000
 
 
 def build_groups(las):
@@ -69,45 +68,47 @@ def _make_output_header(las, overwrite):
         print("Error: 'foliage_type' dimension already exists. Use --overwrite to replace it.")
         sys.exit(1)
 
-    existing_extra = [
-        laspy.ExtraBytesParams(name=d.name, type=d.dtype)
-        for d in las.point_format.extra_dimensions  # laspy 2.x: extra_dimensions, not extra_dims
-        if d.name != 'foliage_type'
-    ]
-    existing_extra.append(laspy.ExtraBytesParams(
-        name="foliage_type", type=np.int8,
-        description="1=leaf,0=wood,-1=other"))
-
+    # Use the integer format ID so LasHeader gets its own fresh PointFormat object
+    # rather than sharing (and mutating) the source's PointFormat via object reference.
     new_header = laspy.LasHeader(
-        point_format=las.header.point_format,
+        point_format=las.header.point_format.id,
         version=las.header.version,
     )
-    new_header.add_extra_dims(existing_extra)  # laspy 2.x: no extra_dims kwarg on LasHeader
     new_header.offsets = las.header.offsets
     new_header.scales = las.header.scales
+    extra_dims = [
+        laspy.ExtraBytesParams(name=d.name, type=d.dtype)
+        for d in las.point_format.extra_dimensions
+        if d.name != 'foliage_type'
+    ]
+    extra_dims.append(laspy.ExtraBytesParams(
+        name="foliage_type", type=np.int8,
+        description="1=leaf,0=wood,-1=other"))
+    new_header.add_extra_dims(extra_dims)
     return new_header
 
 
-def _write_chunk(writer, src_points, src_fmt, indices, lw_values, out_fmt):
+def _write_chunk(writer, src_points, indices, lw_values, out_fmt):
     """Write a subset of source points with foliage_type values to a LasWriter."""
     sub = src_points[indices]
-    buf = np.zeros(len(indices), dtype=out_fmt.dtype)
-    for name in src_fmt.dimension_names:
+    buf = np.zeros(len(indices), dtype=out_fmt.dtype())
+    # Use the raw underlying array dtype names (bit_fields, classification_flags, etc.)
+    # rather than the decoded PointFormat dimension names, which differ and may be mutated.
+    src_raw = sub.array
+    for name in src_raw.dtype.names:
         if name in buf.dtype.names:
-            buf[name] = sub[name]
+            buf[name] = src_raw[name]
     buf['foliage_type'] = lw_values
     writer.write_points(laspy.PackedPointRecord(buf, out_fmt))
 
 
-def _gbs_worker(args):
-    """args = (task_id, xyz_float32, global_indices)"""
-    task_id, xyz_array, global_indices = args
+def _gbs_worker(task_id, global_indices, xyz):
     if len(global_indices) < MIN_COMPONENT_POINTS:
         print("Warning: component with %d points (< %d) skipped."
               % (len(global_indices), MIN_COMPONENT_POINTS))
         return task_id, global_indices, np.full(len(global_indices), SENTINEL, dtype=_LW_DTYPE)
     try:
-        xyz = np.asarray(xyz_array, dtype=np.float32)
+        xyz = xyz[global_indices].astype(np.float32)
         treeHeight = np.max(xyz[:, 2]) - np.min(xyz[:, 2])
         root, _ = getRootPt(xyz, lower_h=0.0, upper_h=0.2)
         xyz = np.append(xyz, root, axis=0)
@@ -160,8 +161,6 @@ def main():
     parser.add_argument("--output_file", required=True, help="path to output .las/.laz")
     parser.add_argument("--dry_run", action="store_true",
                         help="inspect input and exit without writing any files")
-    parser.add_argument("--workers", type=int, default=min(os.cpu_count() or 4, 8),
-                        help="number of parallel processes (default: min(cpu_count, 8))")
     parser.add_argument("--overwrite", action="store_true",
                         help="overwrite the 'foliage_type' dimension if it already exists in the input")
     args = parser.parse_args()
@@ -180,7 +179,6 @@ def main():
 
     new_header = _make_output_header(las, args.overwrite)
     out_fmt = new_header.point_format
-    src_fmt = las.point_format
 
     xyz = np.vstack((las.x, las.y, las.z)).T.astype(np.float32)
     classification = np.asarray(las.classification)
@@ -193,48 +191,32 @@ def main():
     groups = {key: idx[non_other[idx]] for key, idx in groups.items()}
     groups = {key: idx for key, idx in groups.items() if len(idx) > 0}
 
-    # Largest components first: processed while workers are memory-fresh.
     sorted_items = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
-    tasks = [(i, xyz[idx], idx) for i, (_, idx) in enumerate(sorted_items)]
+    tasks = [(i, idx) for i, (_, idx) in enumerate(sorted_items)]
 
     other_indices = np.where(other_mask)[0]
+    non_other_indices = np.where(non_other)[0]
 
-    # Stream results to output as they arrive. Point order in the output differs
-    # from the input: other/ground first, then components in completion order.
-    done_ids: set = set()
-    with laspy.LasWriter(args.output_file, header=new_header) as writer:
-        if len(other_indices):
-            other_lw = np.full(len(other_indices), SENTINEL, dtype=_LW_DTYPE)
-            _write_chunk(writer, las.points, src_fmt, other_indices, other_lw, out_fmt)
+    with open(args.output_file, "wb") as _out_fh, \
+         laspy.LasWriter(_out_fh, header=new_header) as writer:
+        # Stream non-classified points in chunks, then release source data.
+        for start in range(0, len(other_indices), _WRITE_CHUNK):
+            chunk = other_indices[start:start + _WRITE_CHUNK]
+            _write_chunk(writer, las.points, chunk,
+                         np.full(len(chunk), SENTINEL, dtype=_LW_DTYPE), out_fmt)
+
+        # Extract vegetation-only arrays, remap task indices to local, free full arrays.
+        veg_points = las.points[non_other_indices]
+        veg_xyz = xyz[non_other_indices]
+        global_to_local = np.full(len(other_mask), -1, dtype=np.intp)
+        global_to_local[non_other_indices] = np.arange(len(non_other_indices), dtype=np.intp)
+        tasks = [(tid, global_to_local[idx]) for tid, idx in tasks]
+        del las, xyz, other_mask, non_other, other_indices, non_other_indices, global_to_local
 
         with tqdm(total=len(tasks), desc="Processing components") as pbar:
-            remaining = list(tasks)
-            for attempt in range(_MAX_POOL_RETRIES):
-                try:
-                    with mp.Pool(processes=min(args.workers, len(remaining)),
-                                 maxtasksperchild=10) as pool:
-                        for task_id, global_idx, lw in pool.imap_unordered(
-                                _gbs_worker, remaining, chunksize=1):
-                            _write_chunk(writer, las.points, src_fmt, global_idx, lw, out_fmt)
-                            done_ids.add(task_id)
-                            pbar.update()
-                    break
-                except Exception as exc:
-                    remaining = [t for t in remaining if t[0] not in done_ids]
-                    if not remaining:
-                        break
-                    if attempt + 1 < _MAX_POOL_RETRIES:
-                        print("\nPool crashed (%s); restarting with %d remaining components."
-                              % (exc, len(remaining)), file=sys.stderr)
-                    else:
-                        print("\nPool crashed %d times; writing %d unprocessed component(s) as %d."
-                              % (_MAX_POOL_RETRIES, len(remaining), SENTINEL), file=sys.stderr)
-
-            # Guarantee all points appear in the output even after repeated crashes.
-            unprocessed = [t for t in tasks if t[0] not in done_ids]
-            for task_id, _, idx in unprocessed:
-                _write_chunk(writer, las.points, src_fmt, idx,
-                             np.full(len(idx), SENTINEL, dtype=_LW_DTYPE), out_fmt)
+            for task_id, idx in tasks:
+                _, local_idx, lw = _gbs_worker(task_id, idx, veg_xyz)
+                _write_chunk(writer, veg_points, local_idx, lw, out_fmt)
                 pbar.update()
 
 
