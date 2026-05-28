@@ -33,8 +33,9 @@ def build_groups(las):
     if 'component_id' in dim_names:
         component_ids = np.asarray(las['component_id'])
         other_mask = component_ids <= 0
+        unique_vals = np.unique(component_ids[~other_mask])
         groups = {}
-        for value in np.unique(component_ids[~other_mask]):
+        for value in tqdm(unique_vals, desc="Indexing components", unit="comp"):
             groups[int(value)] = all_idx[component_ids == value]
         return groups, 'component_id', other_mask
 
@@ -42,16 +43,18 @@ def build_groups(las):
         tree = np.asarray(las['tree_id'])
         stem = np.asarray(las['stem_id'])
         keys = np.stack((tree, stem), axis=1)
+        unique_vals = np.unique(keys, axis=0)
         groups = {}
-        for value in np.unique(keys, axis=0):
+        for value in tqdm(unique_vals, desc="Indexing components", unit="comp"):
             mask = np.all(keys == value, axis=1)
             groups[(int(value[0]), int(value[1]))] = all_idx[mask]
         return groups, '(tree_id, stem_id)', other_mask
 
     if 'tree_id' in dim_names:
         keys = np.asarray(las['tree_id'])
+        unique_vals = np.unique(keys)
         groups = {}
-        for value in np.unique(keys):
+        for value in tqdm(unique_vals, desc="Indexing components", unit="comp"):
             groups[int(value)] = all_idx[keys == value]
         return groups, 'tree_id', other_mask
 
@@ -168,11 +171,16 @@ def main():
     if not os.path.isfile(args.input_file):
         print("Error: input file not found or not readable: %s" % args.input_file)
         sys.exit(1)
+
+    file_size_gb = os.path.getsize(args.input_file) / 1e9
+    print("Reading %.2f GB: %s" % (file_size_gb, args.input_file))
     try:
         las = laspy.read(args.input_file)
     except Exception as exc:
         print("Error: could not read input file: %s" % exc)
         sys.exit(1)
+    n_pts = len(las.x)
+    print("  Loaded %s points." % f"{n_pts:,}")
 
     if args.dry_run:
         run_dry_run(las, args)
@@ -180,16 +188,27 @@ def main():
     new_header = _make_output_header(las, args.overwrite)
     out_fmt = new_header.point_format
 
+    print("Extracting XYZ coordinates ...")
     xyz = np.vstack((las.x, las.y, las.z)).T.astype(np.float32)
     classification = np.asarray(las.classification)
     ground_mask = classification == GROUND_CLASS
 
-    groups, _strategy, other_mask = build_groups(las)
+    groups, strategy, other_mask = build_groups(las)
     # Ground wins over component membership.
     other_mask = other_mask | ground_mask
     non_other = ~other_mask
     groups = {key: idx[non_other[idx]] for key, idx in groups.items()}
     groups = {key: idx for key, idx in groups.items() if len(idx) > 0}
+
+    n_veg = int(np.sum(non_other))
+    n_ground = int(np.sum(ground_mask))
+    n_unclassified = int(np.sum(other_mask)) - n_ground
+    print("Grouping strategy : %s" % strategy)
+    print("Components        : %d" % len(groups))
+    print("Vegetation pts    : %s" % f"{n_veg:,}")
+    print("Ground pts        : %s" % f"{n_ground:,}")
+    if n_unclassified > 0:
+        print("Unclassified pts  : %s" % f"{n_unclassified:,}")
 
     sorted_items = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
     tasks = [(i, idx) for i, (_, idx) in enumerate(sorted_items)]
@@ -200,29 +219,47 @@ def main():
     # Extract veg_xyz now and immediately free the full xyz and mask arrays.
     # Avoids a ~3 GB veg_points copy later by keeping las.points (already loaded)
     # and writing via original global indices instead.
+    print("Extracting vegetation coordinates (%s pts) ..." % f"{len(non_other_indices):,}")
     veg_xyz = xyz[non_other_indices]
     del xyz, other_mask, non_other
 
     # Remap task global indices to local veg_xyz indices.
     # non_other_indices is sorted (np.where output), so searchsorted is exact.
     tasks = [(tid, np.searchsorted(non_other_indices, global_idx), global_idx)
-             for tid, global_idx in tasks]
+             for tid, global_idx in tqdm(tasks, desc="Remapping indices", unit="comp")]
     del non_other_indices
 
     with open(args.output_file, "wb") as _out_fh, \
          laspy.LasWriter(_out_fh, header=new_header) as writer:
         # Stream non-classified points in chunks.
-        for start in range(0, len(other_indices), _WRITE_CHUNK):
-            chunk = other_indices[start:start + _WRITE_CHUNK]
-            _write_chunk(writer, las.points, chunk,
-                         np.full(len(chunk), SENTINEL, dtype=_LW_DTYPE), out_fmt)
+        n_other = len(other_indices)
+        with tqdm(total=n_other, desc="Writing non-classified",
+                  unit="pts", unit_scale=True) as pbar:
+            for start in range(0, n_other, _WRITE_CHUNK):
+                chunk = other_indices[start:start + _WRITE_CHUNK]
+                _write_chunk(writer, las.points, chunk,
+                             np.full(len(chunk), SENTINEL, dtype=_LW_DTYPE), out_fmt)
+                pbar.update(len(chunk))
         del other_indices
 
+        n_leaf = n_wood = n_failed = 0
         with tqdm(total=len(tasks), desc="Processing components") as pbar:
             for task_id, local_idx, global_idx in tasks:
                 _, _, lw = _gbs_worker(task_id, local_idx, veg_xyz)
+                n_leaf += int(np.sum(lw == 1))
+                n_wood += int(np.sum(lw == 0))
+                n_failed += int(np.sum(lw == SENTINEL))
+                pbar.set_postfix(sz=len(global_idx), leaf=n_leaf,
+                                 wood=n_wood, skip=n_failed)
                 _write_chunk(writer, las.points, global_idx, lw, out_fmt)
                 pbar.update()
+
+    print("Done.")
+    print("  Leaf pts  : %s" % f"{n_leaf:,}")
+    print("  Wood pts  : %s" % f"{n_wood:,}")
+    if n_failed:
+        print("  Skipped   : %s" % f"{n_failed:,}")
+    print("Output: %s" % args.output_file)
 
 
 if __name__ == '__main__':
