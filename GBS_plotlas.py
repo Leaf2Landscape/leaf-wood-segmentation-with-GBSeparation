@@ -70,19 +70,19 @@ def _make_output_header(las, overwrite):
         sys.exit(1)
 
     existing_extra = [
-        laspy.ExtraBytesParams(name=d.name, type=d.type)
-        for d in las.point_format.extra_dims
+        laspy.ExtraBytesParams(name=d.name, type=d.dtype)
+        for d in las.point_format.extra_dimensions  # laspy 2.x: extra_dimensions, not extra_dims
         if d.name != 'foliage_type'
     ]
     existing_extra.append(laspy.ExtraBytesParams(
         name="foliage_type", type=np.int8,
-        description="1=leaf, 0=wood, -1=other/ground/failed"))
+        description="1=leaf,0=wood,-1=other"))
 
     new_header = laspy.LasHeader(
         point_format=las.header.point_format,
         version=las.header.version,
-        extra_dims=existing_extra,
     )
+    new_header.add_extra_dims(existing_extra)  # laspy 2.x: no extra_dims kwarg on LasHeader
     new_header.offsets = las.header.offsets
     new_header.scales = las.header.scales
     return new_header
