@@ -27,35 +27,48 @@ def build_groups(las):
     """
     dim_names = [dim.name for dim in las.point_format.dimensions]
     n_points = len(las.x)
-    all_idx = np.arange(n_points)
     other_mask = np.zeros(n_points, dtype=bool)
 
     if 'component_id' in dim_names:
         component_ids = np.asarray(las['component_id'])
         other_mask = component_ids <= 0
-        unique_vals = np.unique(component_ids[~other_mask])
-        groups = {}
-        for value in tqdm(unique_vals, desc="Indexing components", unit="comp"):
-            groups[int(value)] = all_idx[component_ids == value]
+        veg_idx = np.where(~other_mask)[0]
+        veg_cids = component_ids[veg_idx]
+        print("Indexing %s components (%s pts) ..."
+              % (f"{np.unique(veg_cids).size:,}", f"{len(veg_idx):,}"))
+        order = np.argsort(veg_cids, kind='stable')
+        sorted_cids = veg_cids[order]
+        sorted_idx = veg_idx[order]
+        splits = np.where(np.diff(sorted_cids))[0] + 1
+        boundaries = np.r_[0, splits]
+        groups = {int(sorted_cids[b]): grp
+                  for b, grp in zip(boundaries, np.split(sorted_idx, splits))}
         return groups, 'component_id', other_mask
 
     if 'tree_id' in dim_names and 'stem_id' in dim_names:
         tree = np.asarray(las['tree_id'])
         stem = np.asarray(las['stem_id'])
-        keys = np.stack((tree, stem), axis=1)
-        unique_vals = np.unique(keys, axis=0)
-        groups = {}
-        for value in tqdm(unique_vals, desc="Indexing components", unit="comp"):
-            mask = np.all(keys == value, axis=1)
-            groups[(int(value[0]), int(value[1]))] = all_idx[mask]
+        print("Indexing components by (tree_id, stem_id) (%s pts) ..." % f"{n_points:,}")
+        order = np.lexsort((stem, tree))
+        sorted_tree = tree[order]
+        sorted_stem = stem[order]
+        splits = np.where(
+            (np.diff(sorted_tree) != 0) | (np.diff(sorted_stem) != 0)
+        )[0] + 1
+        boundaries = np.r_[0, splits]
+        groups = {(int(sorted_tree[b]), int(sorted_stem[b])): grp
+                  for b, grp in zip(boundaries, np.split(order, splits))}
         return groups, '(tree_id, stem_id)', other_mask
 
     if 'tree_id' in dim_names:
         keys = np.asarray(las['tree_id'])
-        unique_vals = np.unique(keys)
-        groups = {}
-        for value in tqdm(unique_vals, desc="Indexing components", unit="comp"):
-            groups[int(value)] = all_idx[keys == value]
+        print("Indexing components by tree_id (%s pts) ..." % f"{n_points:,}")
+        order = np.argsort(keys, kind='stable')
+        sorted_keys = keys[order]
+        splits = np.where(np.diff(sorted_keys))[0] + 1
+        boundaries = np.r_[0, splits]
+        groups = {int(sorted_keys[b]): grp
+                  for b, grp in zip(boundaries, np.split(order, splits))}
         return groups, 'tree_id', other_mask
 
     print("Error: no grouping dimension found. Need 'component_id', 'tree_id', "
