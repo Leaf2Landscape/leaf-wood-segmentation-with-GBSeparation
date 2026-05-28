@@ -197,26 +197,31 @@ def main():
     other_indices = np.where(other_mask)[0]
     non_other_indices = np.where(non_other)[0]
 
+    # Extract veg_xyz now and immediately free the full xyz and mask arrays.
+    # Avoids a ~3 GB veg_points copy later by keeping las.points (already loaded)
+    # and writing via original global indices instead.
+    veg_xyz = xyz[non_other_indices]
+    del xyz, other_mask, non_other
+
+    # Remap task global indices to local veg_xyz indices.
+    # non_other_indices is sorted (np.where output), so searchsorted is exact.
+    tasks = [(tid, np.searchsorted(non_other_indices, global_idx), global_idx)
+             for tid, global_idx in tasks]
+    del non_other_indices
+
     with open(args.output_file, "wb") as _out_fh, \
          laspy.LasWriter(_out_fh, header=new_header) as writer:
-        # Stream non-classified points in chunks, then release source data.
+        # Stream non-classified points in chunks.
         for start in range(0, len(other_indices), _WRITE_CHUNK):
             chunk = other_indices[start:start + _WRITE_CHUNK]
             _write_chunk(writer, las.points, chunk,
                          np.full(len(chunk), SENTINEL, dtype=_LW_DTYPE), out_fmt)
-
-        # Extract vegetation-only arrays, remap task indices to local, free full arrays.
-        veg_points = las.points[non_other_indices]
-        veg_xyz = xyz[non_other_indices]
-        global_to_local = np.full(len(other_mask), -1, dtype=np.intp)
-        global_to_local[non_other_indices] = np.arange(len(non_other_indices), dtype=np.intp)
-        tasks = [(tid, global_to_local[idx]) for tid, idx in tasks]
-        del las, xyz, other_mask, non_other, other_indices, non_other_indices, global_to_local
+        del other_indices
 
         with tqdm(total=len(tasks), desc="Processing components") as pbar:
-            for task_id, idx in tasks:
-                _, local_idx, lw = _gbs_worker(task_id, idx, veg_xyz)
-                _write_chunk(writer, veg_points, local_idx, lw, out_fmt)
+            for task_id, local_idx, global_idx in tasks:
+                _, _, lw = _gbs_worker(task_id, local_idx, veg_xyz)
+                _write_chunk(writer, las.points, global_idx, lw, out_fmt)
                 pbar.update()
 
 
