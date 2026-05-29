@@ -196,6 +196,15 @@ def _voxel_downsample(xyz, voxel_size):
     return rep_indices, voxel_assignment
 
 
+def _worker_init():
+    # When maxtasksperchild restarts a worker, fork happens while the parent's
+    # "Processing components" tqdm bar may hold its internal RLock.  The child
+    # inherits the lock in a held state with no thread to release it, so any
+    # tqdm bar creation in the worker (e.g. inside array_to_graph) deadlocks.
+    # Replace tqdm's global lock with a fresh instance to fix the race.
+    tqdm.set_lock(type(tqdm.get_lock())())
+
+
 def _gbs_worker(task_idx):
     """
     Worker entry point for both sequential and multiprocessing execution.
@@ -285,6 +294,8 @@ def _gbs_worker(task_idx):
         foliage_type = rep_labels[voxel_assignment] if use_voxel else rep_labels
         return task_id, foliage_type
     except Exception as exc:
+        import traceback
+        traceback.print_exc()
         print("Warning: component %s failed (%d points): %s" % (comp_key, n_pts, exc))
         return task_id, np.full(n_pts, SENTINEL, dtype=_LW_DTYPE)
 
@@ -417,7 +428,7 @@ def main():
         del other_indices
 
         n_leaf = n_wood = n_failed = 0
-        ctx = Pool(workers, maxtasksperchild=16) if workers > 1 else nullcontext()
+        ctx = Pool(workers, maxtasksperchild=16, initializer=_worker_init) if workers > 1 else nullcontext()
         with ctx as pool, tqdm(total=len(tasks), desc="Processing components") as pbar:
             results = (pool.imap_unordered(_gbs_worker, range(len(tasks)))
                        if pool is not None else map(_gbs_worker, range(len(tasks))))
