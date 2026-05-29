@@ -3,6 +3,7 @@ import sys
 import argparse
 from contextlib import nullcontext, contextmanager
 from multiprocessing import Pool, cpu_count
+import joblib
 import numpy as np
 import laspy
 from tqdm import tqdm
@@ -10,6 +11,21 @@ from GBSeparation.Graph_Path import array_to_graph, extract_path_info
 from GBSeparation.LS_circle import getRootPt
 from GBSeparation.ExtractInitWood import extract_init_wood
 from GBSeparation.ExtractFinalWood import extract_final_wood
+
+def _available_cpus():
+    """CPU count respecting SLURM allocation, falling back to multiprocessing.cpu_count().
+
+    SLURM_CPUS_PER_NODE can be a plain integer or compressed like "16(x2),8";
+    we take the first numeric token which represents this node's allocation.
+    """
+    slurm = os.environ.get('SLURM_CPUS_PER_NODE', '')
+    if slurm:
+        try:
+            return int(slurm.split('(')[0].split(',')[0])
+        except ValueError:
+            pass
+    return cpu_count()
+
 
 GROUND_CLASS = 2
 _LW_DTYPE = np.int8   # 1=leaf, 0=wood, -1=other/ground/failed
@@ -22,8 +38,8 @@ VOXEL_SIZE = 0.02     # metres — grid resolution used to downsample each compo
 # Set in main() before Pool creation; never written by workers.
 _VEG_XYZ = None
 _TASK_LIST = None
-_SKLEARN_JOBS = -1
-_CLASSIFY_PARALLEL = True
+_THREADS_PER_WORKER = -1   # -1 = all cores (sequential path only)
+_SILENCE_IO = False         # True in multi-process mode to prevent terminal write contention
 
 
 @contextmanager
@@ -183,7 +199,7 @@ def _voxel_downsample(xyz, voxel_size):
 def _gbs_worker(task_idx):
     """
     Worker entry point for both sequential and multiprocessing execution.
-    Reads _VEG_XYZ, _TASK_LIST, _SKLEARN_JOBS, _CLASSIFY_PARALLEL from module globals
+    Reads _VEG_XYZ, _TASK_LIST, _THREADS_PER_WORKER, _SILENCE_IO from module globals
     (set in main() before any Pool is created; inherited via fork on Linux).
     Returns (task_id, foliage_type); caller looks up global_idx via _TASK_LIST[task_id].
     """
@@ -232,17 +248,29 @@ def _gbs_worker(task_idx):
         print("  comp %s: %d pts → %d voxels" % (comp_key, n_pts, n_vox), flush=True)
         # Silence library stdout/stderr in parallel workers to prevent blocked
         # terminal writes from hanging the worker before it can return its result.
-        _io_ctx = _silence() if not _CLASSIFY_PARALLEL else nullcontext()
+        _io_ctx = _silence() if _SILENCE_IO else nullcontext()
         with _io_ctx:
-            G = array_to_graph(xyz_sub, root_id, kpairs=3, knn=30,
-                               nbrs_threshold=treeHeight / 30,
-                               nbrs_threshold_step=treeHeight / 60,
-                               n_jobs=_SKLEARN_JOBS)
+            if _THREADS_PER_WORKER == -1:
+                # Sequential path: bare call, all cores via sklearn default.
+                G = array_to_graph(xyz_sub, root_id, kpairs=3, knn=30,
+                                   nbrs_threshold=treeHeight / 30,
+                                   nbrs_threshold_step=treeHeight / 60,
+                                   n_jobs=-1)
+            else:
+                # Multi-process path: joblib threading backend avoids the loky
+                # restriction on spawning sub-processes inside forked workers.
+                with joblib.parallel_backend('threading', n_jobs=_THREADS_PER_WORKER):
+                    G = array_to_graph(xyz_sub, root_id, kpairs=3, knn=30,
+                                       nbrs_threshold=treeHeight / 30,
+                                       nbrs_threshold_step=treeHeight / 60,
+                                       n_jobs=_THREADS_PER_WORKER)
             path_dis, path_list = extract_path_info(G, root_id, return_path=True)
+            _max_workers = None if _THREADS_PER_WORKER == -1 else _THREADS_PER_WORKER
             init_wood_ids = extract_init_wood(xyz_sub, G, root_id, path_dis, path_list,
                                               split_interval=[0.1, 0.2, 0.3, 0.5, 1],
                                               max_angle=0.15 * np.pi,
-                                              classify_parallel=_CLASSIFY_PARALLEL)
+                                              classify_parallel=True,
+                                              max_workers=_max_workers)
             final_wood_mask = extract_final_wood(xyz_sub, root_id, path_dis, path_list,
                                                  init_wood_ids, G)
         final_wood_mask[-1] = False
@@ -290,8 +318,11 @@ def main():
                         help="overwrite the 'foliage_type' dimension if it already exists in the input")
     parser.add_argument("--workers", type=int, default=1,
                         help="number of components to classify in parallel (default: 1). "
-                             "Each worker gets cpu_count//workers cores for sklearn KNN. "
                              "Requires Linux/WSL (uses fork). Recommended: 2–4.")
+    parser.add_argument("--threads", type=int, default=0,
+                        help="threads per worker for KNN and component classification "
+                             "(default: 0 = auto: cpu_count()//workers). "
+                             "Has no effect when --workers 1.")
     args = parser.parse_args()
 
     if not os.path.isfile(args.input_file):
@@ -357,17 +388,15 @@ def main():
 
     # Set module-level globals before any Pool is created so worker processes
     # inherit them via fork without pickling large arrays.
-    global _VEG_XYZ, _TASK_LIST, _SKLEARN_JOBS, _CLASSIFY_PARALLEL
+    global _VEG_XYZ, _TASK_LIST, _THREADS_PER_WORKER, _SILENCE_IO
     _VEG_XYZ = veg_xyz
     _TASK_LIST = tasks
     workers = args.workers
-    # Loky (sklearn's default parallel backend) cannot spawn sub-processes inside
-    # a forked worker, so n_jobs > 1 is silently clamped to 1 by sklearn anyway.
-    # Set it explicitly to 1 here to avoid the UserWarning.
-    _SKLEARN_JOBS = 1 if workers > 1 else -1
-    _CLASSIFY_PARALLEL = workers == 1
+    _SILENCE_IO = workers > 1
     if workers > 1:
-        print("Parallel mode: %d workers (sklearn n_jobs=1 per worker)" % workers)
+        _THREADS_PER_WORKER = args.threads if args.threads > 0 else max(1, _available_cpus() // workers)
+        print("Parallel mode: %d workers, %d threads/worker" % (workers, _THREADS_PER_WORKER))
+    # workers == 1: _THREADS_PER_WORKER stays -1; sequential path is unchanged.
 
     with open(args.output_file, "wb") as _out_fh, \
          laspy.LasWriter(_out_fh, header=new_header) as writer:
