@@ -417,7 +417,7 @@ def main():
         del other_indices
 
         n_leaf = n_wood = n_failed = 0
-        ctx = Pool(workers) if workers > 1 else nullcontext()
+        ctx = Pool(workers, maxtasksperchild=16) if workers > 1 else nullcontext()
         with ctx as pool, tqdm(total=len(tasks), desc="Processing components") as pbar:
             results = (pool.imap_unordered(_gbs_worker, range(len(tasks)))
                        if pool is not None else map(_gbs_worker, range(len(tasks))))
