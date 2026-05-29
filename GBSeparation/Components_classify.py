@@ -2,6 +2,7 @@ import math
 import numpy as np
 from GBSeparation.Eigen_transform import svd_eigen, pca_transform
 from GBSeparation.LS_circle import circleFitError
+from GBSeparation.Graph_Path import reconstruct_path
 
 def components_classify(pcd, components, path_list, t_linearity=0.92, t_error=0.2, split_interval=0.2):
     """
@@ -28,6 +29,7 @@ def components_classify(pcd, components, path_list, t_linearity=0.92, t_error=0.
     classify_components : list
         Record the classification information and elements of each connected component.
     """
+    use_pred = isinstance(path_list, np.ndarray)
     # Record the classification information and elements of each connected component.
     classify_components = []
     # Mark the component index where each point is located.
@@ -45,7 +47,10 @@ def components_classify(pcd, components, path_list, t_linearity=0.92, t_error=0.
             c = classify_component[0]
             if (c != 0):
                 # The shortest path from any point in the cluster to the root point.
-                path = path_list[classify_component[1][0]]
+                if use_pred:
+                    path = reconstruct_path(path_list, classify_component[1][0])
+                else:
+                    path = path_list[classify_component[1][0]]
                 for j in range(len(path) - 1, -1, -1):
                     path_elm = path[j]
                     pre_c = classify_components[components_idx[path_elm]][0]
@@ -86,10 +91,16 @@ def classify_info(pcd, component, path_list, t_linearity, t_error, split_interva
     if(len(component)<max(10, pcd.shape[0]/20000)):
         return 0
 
+    use_pred = isinstance(path_list, np.ndarray)
     # calculate the approximate axial based on path direction.
     axial = np.zeros(3)
     for i in component:
-        if(len(path_list[i])>1):
+        if use_pred:
+            pre = int(path_list[i])
+            if(pre >= 0):
+                dire = pcd[i]-pcd[pre]
+                axial += dire
+        elif(len(path_list[i])>1):
             dire = pcd[path_list[i][-1]]-pcd[path_list[i][-2]]
             axial += dire
     if(np.linalg.norm(axial) == 0):

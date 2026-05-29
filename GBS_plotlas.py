@@ -264,7 +264,7 @@ def _gbs_worker(task_idx):
                                        nbrs_threshold=treeHeight / 30,
                                        nbrs_threshold_step=treeHeight / 60,
                                        n_jobs=_THREADS_PER_WORKER)
-            path_dis, path_list = extract_path_info(G, root_id, return_path=True)
+            path_dis, pred = extract_path_info(G, root_id, return_path=True)
             # Only enable intra-worker threading on the sequential path.
             # When workers > 1, each forked worker spawning a ThreadPoolExecutor
             # that calls np.linalg.svd causes BLAS deadlocks: multiple processes
@@ -272,11 +272,11 @@ def _gbs_worker(task_idx):
             # The process pool already provides outer parallelism; inner threading
             # for this step is not worth the deadlock risk.
             _classify_parallel = _THREADS_PER_WORKER == -1
-            init_wood_ids = extract_init_wood(xyz_sub, G, root_id, path_dis, path_list,
+            init_wood_ids = extract_init_wood(xyz_sub, G, root_id, path_dis, pred,
                                               split_interval=[0.1, 0.2, 0.3, 0.5, 1],
                                               max_angle=0.15 * np.pi,
                                               classify_parallel=_classify_parallel)
-            final_wood_mask = extract_final_wood(xyz_sub, root_id, path_dis, path_list,
+            final_wood_mask = extract_final_wood(xyz_sub, root_id, path_dis, pred,
                                                  init_wood_ids, G)
         final_wood_mask[-1] = False
         # pipeline: True=wood; output: 1=leaf, 0=wood

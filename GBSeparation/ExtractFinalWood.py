@@ -87,9 +87,11 @@ def extract_final_wood_old(pcd, base_id, path_dis, path_list, init_wood_ids, G, 
     return final_wood_mask
 
 import numpy as np
+import scipy.sparse
 from collections import deque
 from itertools import chain
 from typing import Iterable, Dict, List, Set, Hashable
+from GBSeparation.Graph_Path import reconstruct_path
 
 try:
     from tqdm import tqdm
@@ -150,16 +152,22 @@ def extract_final_wood(
 
     N = pcd.shape[0]
 
+    # CSR mode: `path_list` carries the predecessor int array (pred); adjacency
+    # comes from CSR rows. NetworkX mode keeps the original dict/path behaviour.
+    use_csr = scipy.sparse.issparse(G)
+    pred = path_list if use_csr else None
+
     # ---- Quick sanity check for node labeling ----
     # We assume node ids in G line up with 0..N-1 so arrays index directly by node id.
     # If this is not true in your data, relabel the graph before calling this function:
     # G = nx.convert_node_labels_to_integers(G, ordering='sorted') and reorder pcd/path_dis accordingly.
-    try:
-        nodes = list(G.nodes)
-        if len(nodes) != N or min(nodes) != 0 or max(nodes) != N - 1:
-            print("Warning: G nodes do not appear to be 0..N-1. Ensure pcd, path_dis, path_list match G's labeling.")
-    except Exception:
-        pass
+    if not use_csr:
+        try:
+            nodes = list(G.nodes)
+            if len(nodes) != N or min(nodes) != 0 or max(nodes) != N - 1:
+                print("Warning: G nodes do not appear to be 0..N-1. Ensure pcd, path_dis, path_list match G's labeling.")
+        except Exception:
+            pass
 
     # ---- Coerce path_dis to a fast indexable array ----
     if isinstance(path_dis, dict):
@@ -184,8 +192,11 @@ def extract_final_wood(
 
     initial_set: Set[int] = set()
     for i in iterator:
-        # path_list[i] is the full path from root to i; extend the set
-        initial_set.update(path_list[i])
+        # full path from root to i; extend the set
+        if use_csr:
+            initial_set.update(reconstruct_path(pred, i))
+        else:
+            initial_set.update(path_list[i])
 
     current_idx = np.fromiter(initial_set, dtype=np.int64, count=len(initial_set))
     print(f"Initial wood points identified: {current_idx.size}")
@@ -203,20 +214,31 @@ def extract_final_wood(
     # This removes attribute dict lookups from hot loops.
     neighbors: List[List[int]] = [[] for _ in range(N)]
     weights: List[List[float]] = [[] for _ in range(N)]
-    for u in range(N):
-        # G[u] is adjacency dict: neighbor -> edge_attr_dict
-        # Keep both neighbor id and its 'weight'
-        adu = G[u]
-        if not adu:
-            continue
-        # Note: assume 'weight' exists for all edges (as used downstream)
-        nbs = []
-        wts = []
-        for v, d in adu.items():
-            nbs.append(v)
-            wts.append(d.get("weight", 1.0))
-        neighbors[u] = nbs
-        weights[u] = wts
+    if use_csr:
+        indptr = G.indptr
+        cols = G.indices
+        data = G.data
+        for u in range(N):
+            s, e = indptr[u], indptr[u + 1]
+            if s == e:
+                continue
+            neighbors[u] = cols[s:e].tolist()
+            weights[u] = data[s:e].tolist()
+    else:
+        for u in range(N):
+            # G[u] is adjacency dict: neighbor -> edge_attr_dict
+            # Keep both neighbor id and its 'weight'
+            adu = G[u]
+            if not adu:
+                continue
+            # Note: assume 'weight' exists for all edges (as used downstream)
+            nbs = []
+            wts = []
+            for v, d in adu.items():
+                nbs.append(v)
+                wts.append(d.get("weight", 1.0))
+            neighbors[u] = nbs
+            weights[u] = wts
 
     # ---------------------------------
     # 3) Region growth with a single BFS
@@ -252,6 +274,13 @@ def extract_final_wood(
     # Only compute for nodes with a valid predecessor
     for i in range(N):
         if i == base_id:
+            continue
+        if use_csr:
+            pre = int(pred[i])
+            if pre >= 0:
+                pre_dis[i] = path_dis_arr[i] - path_dis_arr[pre]
+            else:
+                pre_dis[i] = 0.0
             continue
         # Be defensive: path_list[i] may be size 1, but in the usual pipeline it’s >=2
         pl = path_list[i]

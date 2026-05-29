@@ -1,7 +1,7 @@
 import datetime
 import numpy as np
 import open3d as o3d
-import networkx as nx
+from scipy.sparse.csgraph import connected_components as csgraph_cc
 from GBSeparation.Graph_Path import array_to_graph, extract_path_info
 from GBSeparation.LS_circle import getRootPt
 from GBSeparation.ExtractInitWood import extract_init_wood
@@ -49,22 +49,22 @@ for i in range(0, len(files)):
     G = array_to_graph(pcd, root_id, kpairs=3, knn=300, nbrs_threshold=treeHeight/30, nbrs_threshold_step=treeHeight/60)
 
     # # save/read already constructed Graph to reduce processing time.
-    print(">>>connected components of constructed Graph: ", nx.number_connected_components(G))
+    n_components, _ = csgraph_cc(G, directed=False)
+    print(">>>connected components of constructed Graph: ", n_components)
     # show_graph(pcd, G)
 
     # extract path info information from graph
     print(str(datetime.datetime.now()) + ' | >>>extracting shortest path information...')
-    path_dis, path_list = extract_path_info(G, root_id, return_path=True)
-    # show_graph(pcd, sp_graph(path_list, root_id))
+    path_dis, pred = extract_path_info(G, root_id, return_path=True)
 
     # extract initial wood points.
     print(str(datetime.datetime.now()) + ' | >>>extracting initial wood points...')
-    init_wood_ids = extract_init_wood(pcd, G, root_id, path_dis, path_list,
+    init_wood_ids = extract_init_wood(pcd, G, root_id, path_dis, pred,
                                   split_interval=[0.1, 0.2, 0.3, 0.5, 1], max_angle=0.15*np.pi)
 
     # extract final wood points.
     print(str(datetime.datetime.now()) + ' | >>>extracting final wood points...')
-    final_wood_mask = extract_final_wood(pcd, root_id, path_dis, path_list, init_wood_ids, G)
+    final_wood_mask = extract_final_wood(pcd, root_id, path_dis, pred, init_wood_ids, G)
 
     # remove the inserted root point and extract wood/leaf points by mask index.
     final_wood_mask[-1] = False

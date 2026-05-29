@@ -1,5 +1,6 @@
 import math
 import numpy as np
+import scipy.sparse
 from GBSeparation.Components_classify import getAngle3D
 from GBSeparation.Components_classify import components_classify
 import networkx as nx
@@ -178,32 +179,68 @@ def extract_init_wood(
         Unique node ids that were classified as wood clusters.
     """
 
+    # CSR mode: path_dis is a distance array indexed by node id and `path_list`
+    # carries the predecessor int array (pred). NetworkX mode keeps the old
+    # dict-based access for backward compatibility.
+    use_csr = scipy.sparse.issparse(G)
+    pred = path_list if use_csr else None
+
     # -----------------------------------------
     # 1) Cut edges by distance and angle guards
     # -----------------------------------------
     print("cut edges...")
     t0 = time.perf_counter()
-    remove_edge_list = []
 
-    # NOTE: assumes path_list[u] has length >= 2 for all non-base nodes used here.
-    for (u, v, d) in tqdm(G.edges(data=True), total=G.number_of_edges(), desc="Processing edges"):
-        if u == base_id or v == base_id:
-            continue
+    if use_csr:
+        # Iterate the upper triangle of the symmetric CSR once; build a filtered
+        # CSR rather than mutating in place. Removed edges are dropped from both
+        # directions so the downstream BFS sees a consistent graph.
+        G_coo = G.tocoo()
+        keep_mask = np.ones(len(G_coo.data), dtype=bool)
+        rr, cc, dd = G_coo.row, G_coo.col, G_coo.data
+        removed = 0
+        for idx in tqdm(range(len(dd)), total=len(dd), desc="Processing edges"):
+            u = int(rr[idx])
+            v = int(cc[idx])
+            if u == base_id or v == base_id:
+                continue
+            pre_u = int(pred[u])
+            pre_v = int(pred[v])
+            if pre_u < 0 or pre_v < 0:
+                continue
+            pre_u_dis = path_dis[u] - path_dis[pre_u]
+            pre_v_dis = path_dis[v] - path_dis[pre_v]
+            pre_u_vec = pcd[u] - pcd[pre_u]
+            pre_v_vec = pcd[v] - pcd[pre_v]
+            if (dd[idx] > 2 * min(pre_u_dis, pre_v_dis)) or (getAngle3D(pre_u_vec, pre_v_vec) > max_angle):
+                keep_mask[idx] = False
+                removed += 1
+        G = scipy.sparse.csr_matrix(
+            (dd[keep_mask], (rr[keep_mask], cc[keep_mask])), shape=G.shape)
+        G.eliminate_zeros()
+        print(f"  removed edges: {removed} in {time.perf_counter() - t0:.3f}s")
+    else:
+        remove_edge_list = []
 
-        pre_u = path_list[u][-2]
-        pre_v = path_list[v][-2]
+        # NOTE: assumes path_list[u] has length >= 2 for all non-base nodes used here.
+        for (u, v, d) in tqdm(G.edges(data=True), total=G.number_of_edges(), desc="Processing edges"):
+            if u == base_id or v == base_id:
+                continue
 
-        pre_u_dis = path_dis[u] - path_dis[pre_u]
-        pre_v_dis = path_dis[v] - path_dis[pre_v]
-        pre_u_vec = pcd[u] - pcd[pre_u]
-        pre_v_vec = pcd[v] - pcd[pre_v]
+            pre_u = path_list[u][-2]
+            pre_v = path_list[v][-2]
 
-        # NOTE: expects an existing getAngle3D(pre_u_vec, pre_v_vec) -> float
-        if (d["weight"] > 2 * min(pre_u_dis, pre_v_dis)) or (getAngle3D(pre_u_vec, pre_v_vec) > max_angle):
-            remove_edge_list.append((u, v))
+            pre_u_dis = path_dis[u] - path_dis[pre_u]
+            pre_v_dis = path_dis[v] - path_dis[pre_v]
+            pre_u_vec = pcd[u] - pcd[pre_u]
+            pre_v_vec = pcd[v] - pcd[pre_v]
 
-    G.remove_edges_from(remove_edge_list)
-    print(f"  removed edges: {len(remove_edge_list)} in {time.perf_counter() - t0:.3f}s")
+            # NOTE: expects an existing getAngle3D(pre_u_vec, pre_v_vec) -> float
+            if (d["weight"] > 2 * min(pre_u_dis, pre_v_dis)) or (getAngle3D(pre_u_vec, pre_v_vec) > max_angle):
+                remove_edge_list.append((u, v))
+
+        G.remove_edges_from(remove_edge_list)
+        print(f"  removed edges: {len(remove_edge_list)} in {time.perf_counter() - t0:.3f}s")
 
     # ---------------------------------------------------------
     # Helper: Single-pass, bin-constrained components (per interval)
@@ -216,6 +253,32 @@ def extract_init_wood(
         This runs in O(|V| + |E|) per interval without constructing subgraphs.
         Returns a list of Python sets (node ids).
         """
+        if use_csr:
+            N = G_.shape[0]
+            indptr = G_.indptr
+            cols = G_.indices
+            bin_idx = np.floor(np.asarray(path_dis_) / interval).astype(np.int64)
+            visited = np.zeros(N, dtype=bool)
+            comps = []
+            for u in range(N):
+                if visited[u]:
+                    continue
+                b = bin_idx[u]
+                stack = [u]
+                visited[u] = True
+                comp = {u}
+                while stack:
+                    x = stack.pop()
+                    for y in cols[indptr[x]:indptr[x + 1]]:
+                        y = int(y)
+                        if (not visited[y]) and (bin_idx[y] == b):
+                            visited[y] = True
+                            comp.add(y)
+                            stack.append(y)
+                if len(comp) >= min_size:
+                    comps.append(comp)
+            return comps
+
         # Compute bin index for each node once per interval
         # dict is robust to non-integer node ids, and fast enough
         bin_idx = {u: math.floor(path_dis_[u] / interval) for u in G_.nodes}

@@ -27,9 +27,11 @@ __status__ = "Development"
 
 import networkx as nx
 import numpy as np
+import scipy.sparse
+from scipy.sparse.csgraph import dijkstra as csgraph_dijkstra
 from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
-def array_to_graph(arr, base_id, kpairs=3, knn=30, nbrs_threshold=0.1,
+def array_to_graph_old(arr, base_id, kpairs=3, knn=30, nbrs_threshold=0.1,
                    nbrs_threshold_step=0.02, graph_threshold=np.inf, n_jobs=-1):
 
     """
@@ -202,7 +204,7 @@ def array_to_graph(arr, base_id, kpairs=3, knn=30, nbrs_threshold=0.1,
 
 
 
-def extract_path_info(G, base_id, return_path=False):
+def extract_path_info_old(G, base_id, return_path=False):
 
     """
     Extracts shortest path information from a NetworkX graph.
@@ -272,3 +274,150 @@ def add_nodes(G, base_node, indices, distance, threshold):
             # threshold, add edge (i[0], i[c]) to Graph.
             G.add_weighted_edges_from([(base_node, indices[c],
                                         distance[c])])
+
+
+def array_to_graph(arr, base_id, kpairs=3, knn=30, nbrs_threshold=0.1,
+                   nbrs_threshold_step=0.02, graph_threshold=np.inf, n_jobs=-1):
+
+    """
+    Converts a numpy.array of points coordinates into a weighted, symmetric
+    scipy.sparse CSR adjacency matrix.
+
+    Mirrors array_to_graph_old's KNN-bridging traversal exactly, but
+    accumulates (row, col, weight) triples instead of mutating a NetworkX
+    graph. Row/col indices are the point cloud indices (0..N-1); the root is
+    the last point. Duplicate edges keep the minimum weight; self-loops are
+    skipped.
+    """
+
+    N = arr.shape[0]
+    nbrs = NearestNeighbors(n_neighbors=knn, metric='euclidean',
+                            leaf_size=15, n_jobs=n_jobs).fit(arr)
+    distances, indices = nbrs.kneighbors(arr)
+    indices = indices.astype(np.int32)
+    print('NN done')
+
+    rows, cols, weights = [], [], []
+
+    def _add_edges(base_node, nn_idx, dd_idx):
+        for i in range(len(nn_idx)):
+            v = int(nn_idx[i])
+            if v == base_node:
+                continue
+            if dd_idx[i] <= graph_threshold:
+                rows.append(base_node)
+                cols.append(v)
+                weights.append(float(dd_idx[i]))
+
+    visited = np.zeros(N, dtype=bool)
+    current_idx = indices[-1]
+    _add_edges(base_id, indices[-1], distances[-1])
+    visited[current_idx] = True
+
+    unprocessed_idx = np.flatnonzero(~visited)
+    temp_nbrs_threshold = nbrs_threshold
+    k = 1
+    previous_test = 0
+    pbar = tqdm(total=N, desc="Processing points")
+    while unprocessed_idx.shape[0] > 0:
+        k += 1
+        test = unprocessed_idx.shape[0]
+        if k % 10 == 0:
+            if test == previous_test:
+                break
+            previous_test = test
+
+        if len(current_idx) > 0:
+            nn = indices[current_idx]
+            dd = distances[current_idx]
+            mask1 = ~visited[nn]
+            nntemp = []
+            for i, g in enumerate(current_idx):
+                nn_idx = nn[i][mask1[i]][0:kpairs+1]
+                dd_idx = dd[i][mask1[i]][0:kpairs+1]
+                nntemp.append(nn_idx)
+                _add_edges(int(g), nn_idx, dd_idx)
+            if nntemp and any(len(t) for t in nntemp):
+                current_idx = np.unique(np.concatenate(nntemp)).astype(np.intp)
+            else:
+                current_idx = np.empty(0, dtype=np.intp)
+            temp_nbrs_threshold = nbrs_threshold
+        else:
+            unprocessed_nn = indices[unprocessed_idx]
+            unprocessed_dd = distances[unprocessed_idx]
+            mask1 = visited[unprocessed_nn]
+            mask2 = unprocessed_dd < temp_nbrs_threshold
+            mask = mask1 & mask2
+            temp_idx = np.unique(np.where(mask)[0])
+            current_idx = unprocessed_idx[temp_idx]
+            nn = indices[current_idx]
+            dd = distances[current_idx]
+            mask = visited[nn]
+            for i, g in enumerate(current_idx):
+                nn_idx = nn[i][mask[i]][0:kpairs+1]
+                dd_idx = dd[i][mask[i]][0:kpairs+1]
+                _add_edges(int(g), nn_idx, dd_idx)
+            if len(current_idx) == 0:
+                temp_nbrs_threshold += nbrs_threshold_step
+
+        visited[current_idx] = True
+        if len(current_idx) > 0:
+            unprocessed_idx = unprocessed_idx[~visited[unprocessed_idx]]
+        pbar.update(len(current_idx))
+    pbar.close()
+
+    # Build symmetric CSR: add both directions, then dedup duplicate (i,j)
+    # entries by keeping the minimum weight (scipy's constructor would sum
+    # them otherwise).
+    rows_arr = np.array(rows + cols, dtype=np.int32)
+    cols_arr = np.array(cols + rows, dtype=np.int32)
+    wts_arr = np.array(weights + weights, dtype=np.float32)
+    order = np.lexsort((wts_arr, cols_arr, rows_arr))
+    r2, c2, d2 = rows_arr[order], cols_arr[order], wts_arr[order]
+    mask = np.empty(len(r2), dtype=bool)
+    if len(r2) > 0:
+        mask[0] = True
+        mask[1:] = (r2[1:] != r2[:-1]) | (c2[1:] != c2[:-1])
+    G = scipy.sparse.csr_matrix((d2[mask], (r2[mask], c2[mask])), shape=(N, N))
+    return G
+
+
+def reconstruct_path(pred, u):
+    """Walk predecessor array from u to root (-1). Returns [root, ..., u]."""
+    path = []
+    while u != -1:
+        path.append(int(u))
+        u = int(pred[u])
+    return path[::-1]
+
+
+def extract_path_info(G, base_id, return_path=False):
+
+    """
+    Extracts shortest path information.
+
+    For a scipy.sparse CSR graph, uses scipy.sparse.csgraph.dijkstra:
+      - return_path=True  -> (dist_array, pred_array), both indexed by node id.
+        pred is int32 with -1 marking root/unreachable (scipy's -9999 sentinel
+        remapped to -1 to match reconstruct_path's terminator).
+      - return_path=False -> dist_array.
+
+    For a NetworkX graph (legacy callers / _old path), defers to the original
+    networkx implementation.
+    """
+
+    if scipy.sparse.issparse(G):
+        if return_path:
+            dist, pred = csgraph_dijkstra(
+                G, directed=False, indices=base_id,
+                return_predecessors=True)
+            pred = pred.astype(np.int32)
+            pred[pred < 0] = -1
+            return dist, pred
+        dist = csgraph_dijkstra(G, directed=False, indices=base_id)
+        return dist
+
+    if return_path:
+        path_dis, path_list = nx.single_source_dijkstra(G, base_id)
+        return path_dis, path_list
+    return nx.single_source_dijkstra_path_length(G, base_id)
