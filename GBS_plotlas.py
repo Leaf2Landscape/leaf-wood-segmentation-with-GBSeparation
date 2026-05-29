@@ -245,11 +245,11 @@ def _gbs_worker(task_idx):
         xyz_sub = np.append(xyz_sub, root, axis=0)
         root_id = xyz_sub.shape[0] - 1
         n_vox = len(xyz_sub) - 1  # -1 to exclude root point
-        print("  comp %s: %d pts → %d voxels" % (comp_key, n_pts, n_vox), flush=True)
         # Silence library stdout/stderr in parallel workers to prevent blocked
         # terminal writes from hanging the worker before it can return its result.
         _io_ctx = _silence() if _SILENCE_IO else nullcontext()
         with _io_ctx:
+            print("  comp %s: %d pts → %d voxels" % (comp_key, n_pts, n_vox), flush=True)
             if _THREADS_PER_WORKER == -1:
                 # Sequential path: bare call, all cores via sklearn default.
                 G = array_to_graph(xyz_sub, root_id, kpairs=3, knn=30,
@@ -265,12 +265,17 @@ def _gbs_worker(task_idx):
                                        nbrs_threshold_step=treeHeight / 60,
                                        n_jobs=_THREADS_PER_WORKER)
             path_dis, path_list = extract_path_info(G, root_id, return_path=True)
-            _max_workers = None if _THREADS_PER_WORKER == -1 else _THREADS_PER_WORKER
+            # Only enable intra-worker threading on the sequential path.
+            # When workers > 1, each forked worker spawning a ThreadPoolExecutor
+            # that calls np.linalg.svd causes BLAS deadlocks: multiple processes
+            # contend on the same BLAS internal thread pool simultaneously.
+            # The process pool already provides outer parallelism; inner threading
+            # for this step is not worth the deadlock risk.
+            _classify_parallel = _THREADS_PER_WORKER == -1
             init_wood_ids = extract_init_wood(xyz_sub, G, root_id, path_dis, path_list,
                                               split_interval=[0.1, 0.2, 0.3, 0.5, 1],
                                               max_angle=0.15 * np.pi,
-                                              classify_parallel=True,
-                                              max_workers=_max_workers)
+                                              classify_parallel=_classify_parallel)
             final_wood_mask = extract_final_wood(xyz_sub, root_id, path_dis, path_list,
                                                  init_wood_ids, G)
         final_wood_mask[-1] = False
