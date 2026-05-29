@@ -1,6 +1,8 @@
 import os
 import sys
 import argparse
+from contextlib import nullcontext
+from multiprocessing import Pool, cpu_count
 import numpy as np
 import laspy
 from tqdm import tqdm
@@ -14,6 +16,14 @@ _LW_DTYPE = np.int8   # 1=leaf, 0=wood, -1=other/ground/failed
 SENTINEL = np.int8(-1)
 MIN_COMPONENT_POINTS = 10
 _WRITE_CHUNK = 100_000
+VOXEL_SIZE = 0.02     # metres — grid resolution used to downsample each component before GBS
+
+# Module-level globals shared with worker processes via fork.
+# Set in main() before Pool creation; never written by workers.
+_VEG_XYZ = None
+_TASK_LIST = None
+_SKLEARN_JOBS = -1
+_CLASSIFY_PARALLEL = True
 
 
 def build_groups(las):
@@ -118,33 +128,101 @@ def _write_chunk(writer, src_points, indices, lw_values, out_fmt):
     writer.write_points(laspy.PackedPointRecord(buf, out_fmt))
 
 
-def _gbs_worker(task_id, global_indices, xyz):
-    if len(global_indices) < MIN_COMPONENT_POINTS:
+def _voxel_downsample(xyz, voxel_size):
+    """
+    Voxel-grid downsample xyz. Pure numpy, no Python loops.
+
+    Returns
+    -------
+    rep_indices      : (M,) indices into xyz of one representative per occupied voxel
+    voxel_assignment : (N,) for each point in xyz, its index into rep_indices
+    """
+    voxel_ijk = np.floor(xyz / voxel_size).astype(np.int64)
+    mn = voxel_ijk.min(axis=0)
+    voxel_ijk -= mn
+    dims = voxel_ijk.max(axis=0) + 1
+    keys = (voxel_ijk[:, 0] * (dims[1] * dims[2])
+            + voxel_ijk[:, 1] * dims[2]
+            + voxel_ijk[:, 2])
+
+    sort_order = np.argsort(keys, kind='stable')
+    sorted_keys = keys[sort_order]
+
+    is_first = np.empty(len(sorted_keys), dtype=bool)
+    is_first[0] = True
+    is_first[1:] = sorted_keys[1:] != sorted_keys[:-1]
+
+    rep_indices = sort_order[is_first]          # one representative per voxel
+    unique_keys = sorted_keys[is_first]
+    voxel_assignment = np.searchsorted(unique_keys, keys)  # each point → rep index
+    return rep_indices, voxel_assignment
+
+
+def _gbs_worker(task_idx):
+    """
+    Worker entry point for both sequential and multiprocessing execution.
+    Reads _VEG_XYZ, _TASK_LIST, _SKLEARN_JOBS, _CLASSIFY_PARALLEL from module globals
+    (set in main() before any Pool is created; inherited via fork on Linux).
+    Returns (task_id, foliage_type); caller looks up global_idx via _TASK_LIST[task_id].
+    """
+    task_id, local_idx, _ = _TASK_LIST[task_idx]
+    n_pts = len(local_idx)
+    if n_pts < MIN_COMPONENT_POINTS:
         print("Warning: component with %d points (< %d) skipped."
-              % (len(global_indices), MIN_COMPONENT_POINTS))
-        return task_id, global_indices, np.full(len(global_indices), SENTINEL, dtype=_LW_DTYPE)
+              % (n_pts, MIN_COMPONENT_POINTS))
+        return task_id, np.full(n_pts, SENTINEL, dtype=_LW_DTYPE)
     try:
-        xyz = xyz[global_indices].astype(np.float32)
-        treeHeight = np.max(xyz[:, 2]) - np.min(xyz[:, 2])
-        root, _ = getRootPt(xyz, lower_h=0.0, upper_h=0.2)
-        xyz = np.append(xyz, root, axis=0)
-        root_id = xyz.shape[0] - 1
-        G = array_to_graph(xyz, root_id, kpairs=3, knn=300,
+        xyz_comp = _VEG_XYZ[local_idx].astype(np.float32)
+
+        # Downsample to VOXEL_SIZE grid; voxel_assignment maps every original
+        # point back to its representative's label after classification.
+        rep_indices, voxel_assignment = _voxel_downsample(xyz_comp, VOXEL_SIZE)
+        if len(rep_indices) >= 30:
+            # Normal path: classify the downsampled cloud, map labels back via voxel assignment.
+            xyz_sub = xyz_comp[rep_indices]
+            use_voxel = True
+        elif n_pts >= 30:
+            # Downsampled cloud is too sparse for knn=30 but the original has enough points.
+            # Classify the original directly; labels map 1-to-1, no voxel assignment needed.
+            print("Warning: component downsampled to %d pts (< knn=30); "
+                  "classifying %d original pts instead." % (len(rep_indices), n_pts))
+            xyz_sub = xyz_comp
+            use_voxel = False
+        else:
+            print("Warning: component %d pts (< knn=30) — skipped." % n_pts)
+            return task_id, np.full(n_pts, SENTINEL, dtype=_LW_DTYPE)
+
+        treeHeight = np.max(xyz_sub[:, 2]) - np.min(xyz_sub[:, 2])
+        root, _ = getRootPt(xyz_sub, lower_h=0.0, upper_h=0.2)
+        # circleFit degenerates (divide-by-zero) when the low-height slice points
+        # are collinear; fall back to the XY centroid of the slice in that case.
+        if not np.isfinite(root).all():
+            low_mask = xyz_sub[:, 2] < (xyz_sub[:, 2].min() + 0.2)
+            src = xyz_sub[low_mask] if low_mask.any() else xyz_sub
+            root = np.array([[src[:, 0].mean(), src[:, 1].mean(),
+                               float(xyz_sub[:, 2].min())]], dtype=np.float32)
+        xyz_sub = np.append(xyz_sub, root, axis=0)
+        root_id = xyz_sub.shape[0] - 1
+        G = array_to_graph(xyz_sub, root_id, kpairs=3, knn=30,
                            nbrs_threshold=treeHeight / 30,
-                           nbrs_threshold_step=treeHeight / 60)
+                           nbrs_threshold_step=treeHeight / 60,
+                           n_jobs=_SKLEARN_JOBS)
         path_dis, path_list = extract_path_info(G, root_id, return_path=True)
-        init_wood_ids = extract_init_wood(xyz, G, root_id, path_dis, path_list,
+        init_wood_ids = extract_init_wood(xyz_sub, G, root_id, path_dis, path_list,
                                           split_interval=[0.1, 0.2, 0.3, 0.5, 1],
-                                          max_angle=0.15 * np.pi)
-        final_wood_mask = extract_final_wood(xyz, root_id, path_dis, path_list,
+                                          max_angle=0.15 * np.pi,
+                                          classify_parallel=_CLASSIFY_PARALLEL)
+        final_wood_mask = extract_final_wood(xyz_sub, root_id, path_dis, path_list,
                                              init_wood_ids, G)
         final_wood_mask[-1] = False
         # pipeline: True=wood; output: 1=leaf, 0=wood
-        foliage_type = (~final_wood_mask[:-1]).astype(_LW_DTYPE)
-        return task_id, global_indices, foliage_type
+        rep_labels = (~final_wood_mask[:-1]).astype(_LW_DTYPE)
+
+        foliage_type = rep_labels[voxel_assignment] if use_voxel else rep_labels
+        return task_id, foliage_type
     except Exception as exc:
-        print("Warning: component failed (%d points): %s" % (len(global_indices), exc))
-        return task_id, global_indices, np.full(len(global_indices), SENTINEL, dtype=_LW_DTYPE)
+        print("Warning: component failed (%d points): %s" % (n_pts, exc))
+        return task_id, np.full(n_pts, SENTINEL, dtype=_LW_DTYPE)
 
 
 def run_dry_run(las, args):
@@ -179,6 +257,10 @@ def main():
                         help="inspect input and exit without writing any files")
     parser.add_argument("--overwrite", action="store_true",
                         help="overwrite the 'foliage_type' dimension if it already exists in the input")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="number of components to classify in parallel (default: 1). "
+                             "Each worker gets cpu_count//workers cores for sklearn KNN. "
+                             "Requires Linux/WSL (uses fork). Recommended: 2–4.")
     args = parser.parse_args()
 
     if not os.path.isfile(args.input_file):
@@ -242,6 +324,20 @@ def main():
              for tid, global_idx in tqdm(tasks, desc="Remapping indices", unit="comp")]
     del non_other_indices
 
+    # Set module-level globals before any Pool is created so worker processes
+    # inherit them via fork without pickling large arrays.
+    global _VEG_XYZ, _TASK_LIST, _SKLEARN_JOBS, _CLASSIFY_PARALLEL
+    _VEG_XYZ = veg_xyz
+    _TASK_LIST = tasks
+    workers = args.workers
+    # Loky (sklearn's default parallel backend) cannot spawn sub-processes inside
+    # a forked worker, so n_jobs > 1 is silently clamped to 1 by sklearn anyway.
+    # Set it explicitly to 1 here to avoid the UserWarning.
+    _SKLEARN_JOBS = 1 if workers > 1 else -1
+    _CLASSIFY_PARALLEL = workers == 1
+    if workers > 1:
+        print("Parallel mode: %d workers (sklearn n_jobs=1 per worker)" % workers)
+
     with open(args.output_file, "wb") as _out_fh, \
          laspy.LasWriter(_out_fh, header=new_header) as writer:
         # Stream non-classified points in chunks.
@@ -256,14 +352,16 @@ def main():
         del other_indices
 
         n_leaf = n_wood = n_failed = 0
-        with tqdm(total=len(tasks), desc="Processing components") as pbar:
-            for task_id, local_idx, global_idx in tasks:
-                _, _, lw = _gbs_worker(task_id, local_idx, veg_xyz)
+        ctx = Pool(workers) if workers > 1 else nullcontext()
+        with ctx as pool, tqdm(total=len(tasks), desc="Processing components") as pbar:
+            results = (pool.imap_unordered(_gbs_worker, range(len(tasks)))
+                       if pool is not None else map(_gbs_worker, range(len(tasks))))
+            for task_id, lw in results:
+                _, _, global_idx = tasks[task_id]
                 n_leaf += int(np.sum(lw == 1))
                 n_wood += int(np.sum(lw == 0))
                 n_failed += int(np.sum(lw == SENTINEL))
-                pbar.set_postfix(sz=len(global_idx), leaf=n_leaf,
-                                 wood=n_wood, skip=n_failed)
+                pbar.set_postfix(sz=len(lw), leaf=n_leaf, wood=n_wood, skip=n_failed)
                 _write_chunk(writer, las.points, global_idx, lw, out_fmt)
                 pbar.update()
 

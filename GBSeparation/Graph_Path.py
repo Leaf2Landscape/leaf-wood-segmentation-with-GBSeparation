@@ -29,8 +29,8 @@ import networkx as nx
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 from tqdm import tqdm
-def array_to_graph(arr, base_id, kpairs=3, knn=300, nbrs_threshold=0.1,
-                   nbrs_threshold_step=0.02, graph_threshold=np.inf):
+def array_to_graph(arr, base_id, kpairs=3, knn=30, nbrs_threshold=0.1,
+                   nbrs_threshold_step=0.02, graph_threshold=np.inf, n_jobs=-1):
 
     """
     Converts a numpy.array of points coordinates into a Weighted BiDirectional
@@ -71,42 +71,40 @@ def array_to_graph(arr, base_id, kpairs=3, knn=300, nbrs_threshold=0.1,
     # Initializing graph.
     G = nx.Graph()
 
-    # Generating array of all indices from 'arr' and all indices to process
-    # 'idx'.
-    idx_base = np.arange(arr.shape[0], dtype=int)
-
     # Initializing NearestNeighbors search and searching for all 'knn'
     # neighboring points arround each point in 'arr'.
     nbrs = NearestNeighbors(n_neighbors=knn, metric='euclidean',
-                            leaf_size=15, n_jobs=-1).fit(arr)
+                            leaf_size=15, n_jobs=n_jobs).fit(arr)
     distances, indices = nbrs.kneighbors(arr)
     indices = indices.astype(int)
     print('NN done')
     # Connecting root point to it's knn.
     add_nodes(G, base_id, indices[-1], distances[-1], graph_threshold)
 
-    # Initializing variables for current ids being processed (current_idx)
-    # and all ids already processed (processed_idx).
+    # Boolean visited array: O(1) mark/lookup, replaces the growing
+    # processed_idx list whose np.isin calls were O(n log n) per iteration.
+    visited = np.zeros(arr.shape[0], dtype=bool)
     current_idx = indices[-1]
-    processed_idx = indices[-1]
-    unprocessed_idx = idx_base[np.isin(idx_base, processed_idx, invert=True)]
+    visited[current_idx] = True
+
+    unprocessed_idx = np.flatnonzero(~visited)
 
     # Initializing temp_nbrs_threshold which will be changed in loop.
     temp_nbrs_threshold = nbrs_threshold
 
     # Looping while there are still indices (idx) left to process.
-    k=1
+    k = 1
     previous_test = 0
     pbar = tqdm(total=arr.shape[0], desc="Processing points")
-    while (unprocessed_idx.shape[0] > 0):
-        k=k+1
+    while unprocessed_idx.shape[0] > 0:
+        k += 1
         test = unprocessed_idx.shape[0]
-        if (k/10 == np.round(k/10)):
-            if (test == previous_test):
+        if k % 10 == 0:
+            if test == previous_test:
                 break
             previous_test = test
         # If current_idx is a list containing several indices.
-        
+
         if len(current_idx) > 0:
 
             # Selecting NearestNeighbors indices and distances for current
@@ -114,8 +112,8 @@ def array_to_graph(arr, base_id, kpairs=3, knn=300, nbrs_threshold=0.1,
             nn = indices[current_idx]
             dd = distances[current_idx]
 
-            # Masking out indices already contained in processed_idx.
-            mask1 = np.isin(nn, processed_idx, invert=True).reshape(nn.shape)
+            # Direct boolean-array lookup replaces np.isin(nn, processed_idx).
+            mask1 = ~visited[nn]
 
             # Initializing temporary list of nearest neighbors. This list
             # is latter used to accumulate points that will be added to
@@ -146,14 +144,13 @@ def array_to_graph(arr, base_id, kpairs=3, knn=300, nbrs_threshold=0.1,
             unprocessed_nn = indices[unprocessed_idx]
             unprocessed_dd = distances[unprocessed_idx]
 
-            # Masking indices in idx2 that have already been processed. The
-            # idea is to connect remaining points to existing graph nodes.
-            mask1 = np.isin(unprocessed_nn, processed_idx).reshape(unprocessed_nn.shape)
+            # Direct boolean-array lookup replaces np.isin(unprocessed_nn, processed_idx).
+            mask1 = visited[unprocessed_nn]
             # Masking neighboring points that are withing threshold distance.
             mask2 = unprocessed_dd < temp_nbrs_threshold
             # mask1 AND mask2. This will mask only indices that are part of
             # the graph and within threshold distance.
-            mask = np.logical_and(mask1, mask2)
+            mask = mask1 & mask2
 
             # Getting unique array of indices that match the criteria from
             # mask1 and mask2.
@@ -167,12 +164,8 @@ def array_to_graph(arr, base_id, kpairs=3, knn=300, nbrs_threshold=0.1,
             nn = indices[current_idx]
             dd = distances[current_idx]
 
-            # Masking points in nn that have already been processed.
-            # This is the oposite approach as above, where points that are
-            # still not in the graph are desired. Now, to make sure the
-            # continuity of the graph is kept, join current remaining indices
-            # to indices already in G.
-            mask = np.isin(nn, processed_idx).reshape(nn.shape)
+            # Direct boolean-array lookup replaces np.isin(nn, processed_idx).
+            mask = visited[nn]
 
             # Looping over current indices's set of nn points and selecting
             # knn points that have alreay been added/processed (mask).
@@ -191,14 +184,12 @@ def array_to_graph(arr, base_id, kpairs=3, knn=300, nbrs_threshold=0.1,
             if len(current_idx) == 0:
                 temp_nbrs_threshold += nbrs_threshold_step
 
-        # Appending current_idx to processed_idx.
-        processed_idx = np.append(processed_idx, current_idx)
-
-        # Generating list of remaining proints to process.
-        unprocessed_idx = idx_base[np.isin(idx_base, processed_idx, invert=True)]
+        # In-place boolean update replaces np.append + full-array copy.
+        visited[current_idx] = True
+        unprocessed_idx = np.flatnonzero(~visited)
 
         pbar.update(len(current_idx))
-    
+
     pbar.close()
 
     return G
