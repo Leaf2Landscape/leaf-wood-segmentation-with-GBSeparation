@@ -50,13 +50,20 @@ def circleFit(arr):
     g = n * sum_y2 - sum_y1 * sum_y1
     h = n * sum_x2y1 + n * sum_y3 - (sum_x2 + sum_y2) * sum_y1
 
-    a = (h * d - e * g) / (c * g - d * d)
-    b = (h * c - e * d) / (d * d - g * c)
+    denom = c * g - d * d
+    if denom == 0:
+        return np.nan, np.nan, np.nan
+
+    a = (h * d - e * g) / denom
+    b = (h * c - e * d) / (-denom)
     c = -(sum_x2 + sum_y2 + a * sum_x1 + b * sum_y1) / n
 
     circle_x = -0.5 * a
     circle_y = -0.5 * b
-    circle_r = 0.5 * math.sqrt(a * a + b * b - 4 * c)
+    disc = a * a + b * b - 4 * c
+    if disc < 0:
+        return np.nan, np.nan, np.nan
+    circle_r = 0.5 * math.sqrt(disc)
 
     return circle_x, circle_y, circle_r
 

@@ -1,7 +1,7 @@
 import os
 import sys
 import argparse
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 from multiprocessing import Pool, cpu_count
 import numpy as np
 import laspy
@@ -24,6 +24,28 @@ _VEG_XYZ = None
 _TASK_LIST = None
 _SKLEARN_JOBS = -1
 _CLASSIFY_PARALLEL = True
+
+
+@contextmanager
+def _silence():
+    """Redirect stdout and stderr to /dev/null for the duration of the block.
+
+    GBSeparation library calls (array_to_graph, extract_init_wood, …) write
+    verbose output — nested tqdm bars, 'NN done', cut-edge counts — directly
+    to stdout/stderr.  In forked parallel workers these writes share the same
+    terminal file descriptor as the parent process's tqdm progress bar.  On
+    some systems the resulting contention blocks the write call, which prevents
+    the worker from ever reaching its return statement and returning the result.
+    Suppressing the output inside parallel workers fixes the hang.
+    """
+    old_out, old_err = sys.stdout, sys.stderr
+    try:
+        devnull = open(os.devnull, 'w')
+        sys.stdout = sys.stderr = devnull
+        yield
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+        devnull.close()
 
 
 def build_groups(las):
@@ -165,11 +187,11 @@ def _gbs_worker(task_idx):
     (set in main() before any Pool is created; inherited via fork on Linux).
     Returns (task_id, foliage_type); caller looks up global_idx via _TASK_LIST[task_id].
     """
-    task_id, local_idx, _ = _TASK_LIST[task_idx]
+    task_id, comp_key, local_idx, _ = _TASK_LIST[task_idx]
     n_pts = len(local_idx)
     if n_pts < MIN_COMPONENT_POINTS:
-        print("Warning: component with %d points (< %d) skipped."
-              % (n_pts, MIN_COMPONENT_POINTS))
+        print("Warning: component %s with %d points (< %d) skipped."
+              % (comp_key, n_pts, MIN_COMPONENT_POINTS))
         return task_id, np.full(n_pts, SENTINEL, dtype=_LW_DTYPE)
     try:
         xyz_comp = _VEG_XYZ[local_idx].astype(np.float32)
@@ -184,15 +206,18 @@ def _gbs_worker(task_idx):
         elif n_pts >= 30:
             # Downsampled cloud is too sparse for knn=30 but the original has enough points.
             # Classify the original directly; labels map 1-to-1, no voxel assignment needed.
-            print("Warning: component downsampled to %d pts (< knn=30); "
-                  "classifying %d original pts instead." % (len(rep_indices), n_pts))
+            print("Warning: component %s downsampled to %d pts (< knn=30); "
+                  "classifying %d original pts instead." % (comp_key, len(rep_indices), n_pts))
             xyz_sub = xyz_comp
             use_voxel = False
         else:
-            print("Warning: component %d pts (< knn=30) — skipped." % n_pts)
+            print("Warning: component %s %d pts (< knn=30) — skipped." % (comp_key, n_pts))
             return task_id, np.full(n_pts, SENTINEL, dtype=_LW_DTYPE)
 
-        treeHeight = np.max(xyz_sub[:, 2]) - np.min(xyz_sub[:, 2])
+        # Use the largest spatial dimension (X, Y, or Z) to derive graph thresholds.
+        # Using only Z (height) gives near-zero thresholds for flat/horizontal structures,
+        # making array_to_graph's bridging loop iterate hundreds of thousands of times.
+        treeHeight = float((np.max(xyz_sub, axis=0) - np.min(xyz_sub, axis=0)).max())
         root, _ = getRootPt(xyz_sub, lower_h=0.0, upper_h=0.2)
         # circleFit degenerates (divide-by-zero) when the low-height slice points
         # are collinear; fall back to the XY centroid of the slice in that case.
@@ -203,17 +228,23 @@ def _gbs_worker(task_idx):
                                float(xyz_sub[:, 2].min())]], dtype=np.float32)
         xyz_sub = np.append(xyz_sub, root, axis=0)
         root_id = xyz_sub.shape[0] - 1
-        G = array_to_graph(xyz_sub, root_id, kpairs=3, knn=30,
-                           nbrs_threshold=treeHeight / 30,
-                           nbrs_threshold_step=treeHeight / 60,
-                           n_jobs=_SKLEARN_JOBS)
-        path_dis, path_list = extract_path_info(G, root_id, return_path=True)
-        init_wood_ids = extract_init_wood(xyz_sub, G, root_id, path_dis, path_list,
-                                          split_interval=[0.1, 0.2, 0.3, 0.5, 1],
-                                          max_angle=0.15 * np.pi,
-                                          classify_parallel=_CLASSIFY_PARALLEL)
-        final_wood_mask = extract_final_wood(xyz_sub, root_id, path_dis, path_list,
-                                             init_wood_ids, G)
+        n_vox = len(xyz_sub) - 1  # -1 to exclude root point
+        print("  comp %s: %d pts → %d voxels" % (comp_key, n_pts, n_vox), flush=True)
+        # Silence library stdout/stderr in parallel workers to prevent blocked
+        # terminal writes from hanging the worker before it can return its result.
+        _io_ctx = _silence() if not _CLASSIFY_PARALLEL else nullcontext()
+        with _io_ctx:
+            G = array_to_graph(xyz_sub, root_id, kpairs=3, knn=30,
+                               nbrs_threshold=treeHeight / 30,
+                               nbrs_threshold_step=treeHeight / 60,
+                               n_jobs=_SKLEARN_JOBS)
+            path_dis, path_list = extract_path_info(G, root_id, return_path=True)
+            init_wood_ids = extract_init_wood(xyz_sub, G, root_id, path_dis, path_list,
+                                              split_interval=[0.1, 0.2, 0.3, 0.5, 1],
+                                              max_angle=0.15 * np.pi,
+                                              classify_parallel=_CLASSIFY_PARALLEL)
+            final_wood_mask = extract_final_wood(xyz_sub, root_id, path_dis, path_list,
+                                                 init_wood_ids, G)
         final_wood_mask[-1] = False
         # pipeline: True=wood; output: 1=leaf, 0=wood
         rep_labels = (~final_wood_mask[:-1]).astype(_LW_DTYPE)
@@ -221,7 +252,7 @@ def _gbs_worker(task_idx):
         foliage_type = rep_labels[voxel_assignment] if use_voxel else rep_labels
         return task_id, foliage_type
     except Exception as exc:
-        print("Warning: component failed (%d points): %s" % (n_pts, exc))
+        print("Warning: component %s failed (%d points): %s" % (comp_key, n_pts, exc))
         return task_id, np.full(n_pts, SENTINEL, dtype=_LW_DTYPE)
 
 
@@ -306,7 +337,7 @@ def main():
         print("Unclassified pts  : %s" % f"{n_unclassified:,}")
 
     sorted_items = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
-    tasks = [(i, idx) for i, (_, idx) in enumerate(sorted_items)]
+    tasks = [(i, key, idx) for i, (key, idx) in enumerate(sorted_items)]
 
     other_indices = np.where(other_mask)[0]
     non_other_indices = np.where(non_other)[0]
@@ -320,8 +351,8 @@ def main():
 
     # Remap task global indices to local veg_xyz indices.
     # non_other_indices is sorted (np.where output), so searchsorted is exact.
-    tasks = [(tid, np.searchsorted(non_other_indices, global_idx), global_idx)
-             for tid, global_idx in tqdm(tasks, desc="Remapping indices", unit="comp")]
+    tasks = [(tid, key, np.searchsorted(non_other_indices, global_idx), global_idx)
+             for tid, key, global_idx in tqdm(tasks, desc="Remapping indices", unit="comp")]
     del non_other_indices
 
     # Set module-level globals before any Pool is created so worker processes
@@ -356,14 +387,18 @@ def main():
         with ctx as pool, tqdm(total=len(tasks), desc="Processing components") as pbar:
             results = (pool.imap_unordered(_gbs_worker, range(len(tasks)))
                        if pool is not None else map(_gbs_worker, range(len(tasks))))
-            for task_id, lw in results:
-                _, _, global_idx = tasks[task_id]
-                n_leaf += int(np.sum(lw == 1))
-                n_wood += int(np.sum(lw == 0))
-                n_failed += int(np.sum(lw == SENTINEL))
-                pbar.set_postfix(sz=len(lw), leaf=n_leaf, wood=n_wood, skip=n_failed)
-                _write_chunk(writer, las.points, global_idx, lw, out_fmt)
-                pbar.update()
+            try:
+                for task_id, lw in results:
+                    _, _, _, global_idx = tasks[task_id]
+                    n_leaf += int(np.sum(lw == 1))
+                    n_wood += int(np.sum(lw == 0))
+                    n_failed += int(np.sum(lw == SENTINEL))
+                    pbar.set_postfix(sz=len(lw), leaf=n_leaf, wood=n_wood, skip=n_failed)
+                    _write_chunk(writer, las.points, global_idx, lw, out_fmt)
+                    pbar.update()
+            except Exception as exc:
+                print("\nERROR: worker process crashed unexpectedly: %s" % exc)
+                print("Output written up to this point; remaining components unclassified.")
 
     print("Done.")
     print("  Leaf pts  : %s" % f"{n_leaf:,}")

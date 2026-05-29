@@ -131,7 +131,10 @@ def array_to_graph(arr, base_id, kpairs=3, knn=30, nbrs_threshold=0.1,
                 add_nodes(G, g, nn_idx, dd_idx, graph_threshold)
 
             # Obtaining an unique array of points currently being processed.
-            current_idx = np.unique([t2 for t1 in nntemp for t2 in t1])
+            if nntemp and any(len(t) for t in nntemp):
+                current_idx = np.unique(np.concatenate(nntemp)).astype(np.intp)
+            else:
+                current_idx = np.empty(0, dtype=np.intp)
 
             # reset the temp_nbrs_threshold
             temp_nbrs_threshold = nbrs_threshold
@@ -184,9 +187,12 @@ def array_to_graph(arr, base_id, kpairs=3, knn=30, nbrs_threshold=0.1,
             if len(current_idx) == 0:
                 temp_nbrs_threshold += nbrs_threshold_step
 
-        # In-place boolean update replaces np.append + full-array copy.
+        # In-place boolean update; then filter unprocessed_idx incrementally
+        # (O(m) per iteration, m shrinks) instead of flatnonzero on the full
+        # n-element array (O(n) per iteration regardless of remaining work).
         visited[current_idx] = True
-        unprocessed_idx = np.flatnonzero(~visited)
+        if len(current_idx) > 0:
+            unprocessed_idx = unprocessed_idx[~visited[unprocessed_idx]]
 
         pbar.update(len(current_idx))
 
