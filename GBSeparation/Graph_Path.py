@@ -98,107 +98,108 @@ def array_to_graph_old(arr, base_id, kpairs=3, knn=30, nbrs_threshold=0.1,
     k = 1
     previous_test = 0
     pbar = tqdm(total=arr.shape[0], desc="Processing points")
-    while unprocessed_idx.shape[0] > 0:
-        k += 1
-        test = unprocessed_idx.shape[0]
-        if k % 10 == 0:
-            if test == previous_test:
-                break
-            previous_test = test
-        # If current_idx is a list containing several indices.
+    try:
+        while unprocessed_idx.shape[0] > 0:
+            k += 1
+            test = unprocessed_idx.shape[0]
+            if k % 10 == 0:
+                if test == previous_test:
+                    break
+                previous_test = test
+            # If current_idx is a list containing several indices.
 
-        if len(current_idx) > 0:
+            if len(current_idx) > 0:
 
-            # Selecting NearestNeighbors indices and distances for current
-            # indices being processed.
-            nn = indices[current_idx]
-            dd = distances[current_idx]
+                # Selecting NearestNeighbors indices and distances for current
+                # indices being processed.
+                nn = indices[current_idx]
+                dd = distances[current_idx]
 
-            # Direct boolean-array lookup replaces np.isin(nn, processed_idx).
-            mask1 = ~visited[nn]
+                # Direct boolean-array lookup replaces np.isin(nn, processed_idx).
+                mask1 = ~visited[nn]
 
-            # Initializing temporary list of nearest neighbors. This list
-            # is latter used to accumulate points that will be added to
-            # processed points list.
-            nntemp = []
+                # Initializing temporary list of nearest neighbors. This list
+                # is latter used to accumulate points that will be added to
+                # processed points list.
+                nntemp = []
 
-            # Looping over current indices's set of nn points and selecting
-            # knn points that hasn't been added/processed yet (mask1).
-            for i, (n, d, g) in enumerate(zip(nn, dd, current_idx)):
-                nn_idx = n[mask1[i]][0:kpairs+1]
-                dd_idx = d[mask1[i]][0:kpairs+1]
-                nntemp.append(nn_idx)
+                # Looping over current indices's set of nn points and selecting
+                # knn points that hasn't been added/processed yet (mask1).
+                for i, (n, d, g) in enumerate(zip(nn, dd, current_idx)):
+                    nn_idx = n[mask1[i]][0:kpairs+1]
+                    dd_idx = d[mask1[i]][0:kpairs+1]
+                    nntemp.append(nn_idx)
 
-                # Adding current knn selected points as nodes to graph G.
-                add_nodes(G, g, nn_idx, dd_idx, graph_threshold)
+                    # Adding current knn selected points as nodes to graph G.
+                    add_nodes(G, g, nn_idx, dd_idx, graph_threshold)
 
-            # Obtaining an unique array of points currently being processed.
-            if nntemp and any(len(t) for t in nntemp):
-                current_idx = np.unique(np.concatenate(nntemp)).astype(np.intp)
-            else:
-                current_idx = np.empty(0, dtype=np.intp)
+                # Obtaining an unique array of points currently being processed.
+                if nntemp and any(len(t) for t in nntemp):
+                    current_idx = np.unique(np.concatenate(nntemp)).astype(np.intp)
+                else:
+                    current_idx = np.empty(0, dtype=np.intp)
 
-            # reset the temp_nbrs_threshold
-            temp_nbrs_threshold = nbrs_threshold
+                # reset the temp_nbrs_threshold
+                temp_nbrs_threshold = nbrs_threshold
 
-        # If current_idx is an empty list.
-        elif len(current_idx) == 0:
+            # If current_idx is an empty list.
+            elif len(current_idx) == 0:
 
-            # Getting NearestNeighbors indices and distance for all indices
-            # that remain to be processed.
-            unprocessed_nn = indices[unprocessed_idx]
-            unprocessed_dd = distances[unprocessed_idx]
+                # Getting NearestNeighbors indices and distance for all indices
+                # that remain to be processed.
+                unprocessed_nn = indices[unprocessed_idx]
+                unprocessed_dd = distances[unprocessed_idx]
 
-            # Direct boolean-array lookup replaces np.isin(unprocessed_nn, processed_idx).
-            mask1 = visited[unprocessed_nn]
-            # Masking neighboring points that are withing threshold distance.
-            mask2 = unprocessed_dd < temp_nbrs_threshold
-            # mask1 AND mask2. This will mask only indices that are part of
-            # the graph and within threshold distance.
-            mask = mask1 & mask2
+                # Direct boolean-array lookup replaces np.isin(unprocessed_nn, processed_idx).
+                mask1 = visited[unprocessed_nn]
+                # Masking neighboring points that are withing threshold distance.
+                mask2 = unprocessed_dd < temp_nbrs_threshold
+                # mask1 AND mask2. This will mask only indices that are part of
+                # the graph and within threshold distance.
+                mask = mask1 & mask2
 
-            # Getting unique array of indices that match the criteria from
-            # mask1 and mask2.
-            temp_idx = np.unique(np.where(mask)[0])
-            # Assigns remaining indices (idx) matched in temp_idx to
-            # current_idx.
-            current_idx = unprocessed_idx[temp_idx]
+                # Getting unique array of indices that match the criteria from
+                # mask1 and mask2.
+                temp_idx = np.unique(np.where(mask)[0])
+                # Assigns remaining indices (idx) matched in temp_idx to
+                # current_idx.
+                current_idx = unprocessed_idx[temp_idx]
 
-            # Selecting NearestNeighbors indices and distances for current
-            # indices being processed.
-            nn = indices[current_idx]
-            dd = distances[current_idx]
+                # Selecting NearestNeighbors indices and distances for current
+                # indices being processed.
+                nn = indices[current_idx]
+                dd = distances[current_idx]
 
-            # Direct boolean-array lookup replaces np.isin(nn, processed_idx).
-            mask = visited[nn]
+                # Direct boolean-array lookup replaces np.isin(nn, processed_idx).
+                mask = visited[nn]
 
-            # Looping over current indices's set of nn points and selecting
-            # knn points that have alreay been added/processed (mask).
-            # Also, to ensure continuity over next iteration, select another
-            # kpairs points from indices that haven't been processed (~mask).
-            for i, (n, d, g) in enumerate(zip(nn, dd, current_idx)):
-                nn_idx = n[mask[i]][0:kpairs+1]
-                dd_idx = d[mask[i]][0:kpairs+1]
+                # Looping over current indices's set of nn points and selecting
+                # knn points that have alreay been added/processed (mask).
+                # Also, to ensure continuity over next iteration, select another
+                # kpairs points from indices that haven't been processed (~mask).
+                for i, (n, d, g) in enumerate(zip(nn, dd, current_idx)):
+                    nn_idx = n[mask[i]][0:kpairs+1]
+                    dd_idx = d[mask[i]][0:kpairs+1]
 
-                # Adding current knn selected points as nodes to graph G.
-                add_nodes(G, g, nn_idx, dd_idx, graph_threshold)
+                    # Adding current knn selected points as nodes to graph G.
+                    add_nodes(G, g, nn_idx, dd_idx, graph_threshold)
 
-            # Check if current_idx is still empty. If so, increase the
-            # nbrs_threshold to try to include more points in the next
-            # iteration.
-            if len(current_idx) == 0:
-                temp_nbrs_threshold += nbrs_threshold_step
+                # Check if current_idx is still empty. If so, increase the
+                # nbrs_threshold to try to include more points in the next
+                # iteration.
+                if len(current_idx) == 0:
+                    temp_nbrs_threshold += nbrs_threshold_step
 
-        # In-place boolean update; then filter unprocessed_idx incrementally
-        # (O(m) per iteration, m shrinks) instead of flatnonzero on the full
-        # n-element array (O(n) per iteration regardless of remaining work).
-        visited[current_idx] = True
-        if len(current_idx) > 0:
-            unprocessed_idx = unprocessed_idx[~visited[unprocessed_idx]]
+            # In-place boolean update; then filter unprocessed_idx incrementally
+            # (O(m) per iteration, m shrinks) instead of flatnonzero on the full
+            # n-element array (O(n) per iteration regardless of remaining work).
+            visited[current_idx] = True
+            if len(current_idx) > 0:
+                unprocessed_idx = unprocessed_idx[~visited[unprocessed_idx]]
 
-        pbar.update(len(current_idx))
-
-    pbar.close()
+            pbar.update(len(current_idx))
+    finally:
+        pbar.close()
 
     return G
 
@@ -319,61 +320,78 @@ def array_to_graph(arr, base_id, kpairs=3, knn=30, nbrs_threshold=0.1,
     k = 1
     previous_test = 0
     pbar = tqdm(total=N, desc="Processing points")
-    while unprocessed_idx.shape[0] > 0:
-        k += 1
-        test = unprocessed_idx.shape[0]
-        if k % 10 == 0:
-            if test == previous_test:
-                break
-            previous_test = test
+    try:
+        while unprocessed_idx.shape[0] > 0:
+            k += 1
+            test = unprocessed_idx.shape[0]
+            if k % 10 == 0:
+                if test == previous_test:
+                    break
+                previous_test = test
 
-        if len(current_idx) > 0:
-            nn = indices[current_idx]
-            dd = distances[current_idx]
-            mask1 = ~visited[nn]
-            nntemp = []
-            for i, g in enumerate(current_idx):
-                nn_idx = nn[i][mask1[i]][0:kpairs+1]
-                dd_idx = dd[i][mask1[i]][0:kpairs+1]
-                nntemp.append(nn_idx)
-                _add_edges(int(g), nn_idx, dd_idx)
-            if nntemp and any(len(t) for t in nntemp):
-                current_idx = np.unique(np.concatenate(nntemp)).astype(np.intp)
+            if len(current_idx) > 0:
+                nn = indices[current_idx]
+                dd = distances[current_idx]
+                mask1 = ~visited[nn]
+                nntemp = []
+                for i, g in enumerate(current_idx):
+                    nn_idx = nn[i][mask1[i]][0:kpairs+1]
+                    dd_idx = dd[i][mask1[i]][0:kpairs+1]
+                    nntemp.append(nn_idx)
+                    _add_edges(int(g), nn_idx, dd_idx)
+                if nntemp and any(len(t) for t in nntemp):
+                    current_idx = np.unique(np.concatenate(nntemp)).astype(np.intp)
+                else:
+                    current_idx = np.empty(0, dtype=np.intp)
+                temp_nbrs_threshold = nbrs_threshold
             else:
-                current_idx = np.empty(0, dtype=np.intp)
-            temp_nbrs_threshold = nbrs_threshold
-        else:
-            unprocessed_nn = indices[unprocessed_idx]
-            unprocessed_dd = distances[unprocessed_idx]
-            mask1 = visited[unprocessed_nn]
-            mask2 = unprocessed_dd < temp_nbrs_threshold
-            mask = mask1 & mask2
-            temp_idx = np.unique(np.where(mask)[0])
-            current_idx = unprocessed_idx[temp_idx]
-            nn = indices[current_idx]
-            dd = distances[current_idx]
-            mask = visited[nn]
-            for i, g in enumerate(current_idx):
-                nn_idx = nn[i][mask[i]][0:kpairs+1]
-                dd_idx = dd[i][mask[i]][0:kpairs+1]
-                _add_edges(int(g), nn_idx, dd_idx)
-            if len(current_idx) == 0:
-                temp_nbrs_threshold += nbrs_threshold_step
+                unprocessed_nn = indices[unprocessed_idx]
+                unprocessed_dd = distances[unprocessed_idx]
+                mask1 = visited[unprocessed_nn]
+                mask2 = unprocessed_dd < temp_nbrs_threshold
+                mask = mask1 & mask2
+                temp_idx = np.unique(np.where(mask)[0])
+                current_idx = unprocessed_idx[temp_idx]
+                nn = indices[current_idx]
+                dd = distances[current_idx]
+                mask = visited[nn]
+                for i, g in enumerate(current_idx):
+                    nn_idx = nn[i][mask[i]][0:kpairs+1]
+                    dd_idx = dd[i][mask[i]][0:kpairs+1]
+                    _add_edges(int(g), nn_idx, dd_idx)
+                if len(current_idx) == 0:
+                    temp_nbrs_threshold += nbrs_threshold_step
 
-        visited[current_idx] = True
-        if len(current_idx) > 0:
-            unprocessed_idx = unprocessed_idx[~visited[unprocessed_idx]]
-        pbar.update(len(current_idx))
-    pbar.close()
+            visited[current_idx] = True
+            if len(current_idx) > 0:
+                unprocessed_idx = unprocessed_idx[~visited[unprocessed_idx]]
+            pbar.update(len(current_idx))
+    finally:
+        pbar.close()
 
     # Build symmetric CSR: add both directions, then dedup duplicate (i,j)
     # entries by keeping the minimum weight (scipy's constructor would sum
     # them otherwise).
-    rows_arr = np.array(rows + cols, dtype=np.int32)
-    cols_arr = np.array(cols + rows, dtype=np.int32)
-    wts_arr = np.array(weights + weights, dtype=np.float32)
+    #
+    # Memory note: avoid `rows + cols` Python list concatenation — for large
+    # trees it briefly doubles the Python-object heap before np.array() can
+    # free it.  Instead convert each list to numpy first, then np.concatenate
+    # (which operates on compact arrays and never materialises a doubled Python
+    # list).
+    r_fwd = np.array(rows,    dtype=np.int32)
+    c_fwd = np.array(cols,    dtype=np.int32)
+    w_fwd = np.array(weights, dtype=np.float32)
+    del rows, cols, weights          # release Python-object lists immediately
+
+    rows_arr = np.concatenate((r_fwd, c_fwd))   # symmetric: fwd + rev
+    cols_arr = np.concatenate((c_fwd, r_fwd))
+    wts_arr  = np.concatenate((w_fwd, w_fwd))
+    del r_fwd, c_fwd, w_fwd         # release per-direction arrays
+
     order = np.lexsort((wts_arr, cols_arr, rows_arr))
     r2, c2, d2 = rows_arr[order], cols_arr[order], wts_arr[order]
+    del rows_arr, cols_arr, wts_arr, order   # free before CSR allocation
+
     mask = np.empty(len(r2), dtype=bool)
     if len(r2) > 0:
         mask[0] = True

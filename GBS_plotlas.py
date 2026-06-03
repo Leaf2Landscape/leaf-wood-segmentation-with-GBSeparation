@@ -7,6 +7,7 @@ import joblib
 import numpy as np
 import laspy
 from tqdm import tqdm
+import threadpoolctl
 from GBSeparation.Graph_Path import array_to_graph, extract_path_info
 from GBSeparation.LS_circle import getRootPt
 from GBSeparation.ExtractInitWood import extract_init_wood
@@ -203,6 +204,14 @@ def _worker_init():
     # tqdm bar creation in the worker (e.g. inside array_to_graph) deadlocks.
     # Replace tqdm's global lock with a fresh instance to fix the race.
     tqdm.set_lock(type(tqdm.get_lock())())
+    # Cap BLAS (OpenBLAS/MKL) internal thread pools to _THREADS_PER_WORKER.
+    # Without this limit each forked worker inherits the full cpu_count() default
+    # (22 on this machine), so workers × joblib_threads × BLAS_threads threads are
+    # spawned simultaneously, exhausting WSL2's per-process thread limit (~99%).
+    # threadpoolctl works post-fork on the child side; env-var approaches must be
+    # set pre-fork and do not help when maxtasksperchild respawns workers mid-run.
+    if _THREADS_PER_WORKER > 0:
+        threadpoolctl.threadpool_limits(limits=_THREADS_PER_WORKER, user_api='blas')
 
 
 def _gbs_worker(task_idx):
@@ -294,9 +303,14 @@ def _gbs_worker(task_idx):
         foliage_type = rep_labels[voxel_assignment] if use_voxel else rep_labels
         return task_id, foliage_type
     except Exception as exc:
-        import traceback
-        traceback.print_exc()
-        print("Warning: component %s failed (%d points): %s" % (comp_key, n_pts, exc))
+        import traceback as _tb
+        # Capture the full traceback as a string and emit it as a single
+        # tqdm.write() call so it is not overwritten by the parent's tqdm
+        # progress bar (which uses carriage-return and would stomp a
+        # multi-line traceback written directly to the shared terminal fd).
+        tb_str = _tb.format_exc().rstrip()
+        tqdm.write("Warning: component %s failed (%d points): %s\n%s"
+                   % (comp_key, n_pts, exc, tb_str))
         return task_id, np.full(n_pts, SENTINEL, dtype=_LW_DTYPE)
 
 
