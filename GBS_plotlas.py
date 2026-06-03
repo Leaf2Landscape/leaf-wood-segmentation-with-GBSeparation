@@ -16,13 +16,21 @@ from GBSeparation.ExtractFinalWood import extract_final_wood
 def _available_cpus():
     """CPU count respecting SLURM allocation, falling back to multiprocessing.cpu_count().
 
-    SLURM_CPUS_PER_NODE can be a plain integer or compressed like "16(x2),8";
-    we take the first numeric token which represents this node's allocation.
+    Priority:
+      1. SLURM_CPUS_PER_TASK  — CPUs allocated to this task (--cpus-per-task); always a plain int.
+      2. SLURM_CPUS_PER_NODE  — node allocation; may be compressed like "16(x2),8"; take first token.
+      3. multiprocessing.cpu_count() — OS fallback (may return node-wide count on shared HPC nodes).
     """
-    slurm = os.environ.get('SLURM_CPUS_PER_NODE', '')
-    if slurm:
+    task_cpus = os.environ.get('SLURM_CPUS_PER_TASK', '')
+    if task_cpus:
         try:
-            return int(slurm.split('(')[0].split(',')[0])
+            return int(task_cpus)
+        except ValueError:
+            pass
+    node_cpus = os.environ.get('SLURM_CPUS_PER_NODE', '')
+    if node_cpus:
+        try:
+            return int(node_cpus.split('(')[0].split(',')[0])
         except ValueError:
             pass
     return cpu_count()
@@ -424,7 +432,7 @@ def main():
     workers = args.workers
     _SILENCE_IO = workers > 1
     if workers > 1:
-        _THREADS_PER_WORKER = args.threads if args.threads > 0 else max(1, _available_cpus() // workers)
+        _THREADS_PER_WORKER = args.threads if args.threads > 0 else max(1, _available_cpus() // (workers * 2))
         print("Parallel mode: %d workers, %d threads/worker" % (workers, _THREADS_PER_WORKER))
     # workers == 1: _THREADS_PER_WORKER stays -1; sequential path is unchanged.
 
