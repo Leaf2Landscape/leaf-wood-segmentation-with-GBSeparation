@@ -56,13 +56,13 @@ def separate(pcd, lower_h=0.0, upper_h=0.2, kpairs=3, knn=300,
                        nbrs_threshold=tree_height / 30,
                        nbrs_threshold_step=tree_height / 60)
 
-    path_dis, path_list = extract_path_info(G, root_id, return_path=True)
+    path_dis, pred = extract_path_info(G, root_id, return_path=True)
 
-    init_wood_ids = extract_init_wood(pcd, G, root_id, path_dis, path_list,
+    init_wood_ids = extract_init_wood(pcd, G, root_id, path_dis, pred,
                                       split_interval=split_interval,
                                       max_angle=max_angle_factor * np.pi)
 
-    final_wood_mask = extract_final_wood(pcd, root_id, path_dis, path_list,
+    final_wood_mask = extract_final_wood(pcd, root_id, path_dis, pred,
                                          init_wood_ids, G)
 
     # Remove the inserted root point
