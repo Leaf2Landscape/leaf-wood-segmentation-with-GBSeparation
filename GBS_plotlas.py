@@ -299,7 +299,7 @@ def _gbs_worker(task_idx):
             # The process pool already provides outer parallelism; inner threading
             # for this step is not worth the deadlock risk.
             _classify_parallel = _THREADS_PER_WORKER == -1
-            init_wood_ids = extract_init_wood(xyz_sub, G, root_id, path_dis, pred,
+            init_wood_ids, G = extract_init_wood(xyz_sub, G, root_id, path_dis, pred,
                                               split_interval=[0.1, 0.2, 0.3, 0.5, 1],
                                               max_angle=0.15 * np.pi,
                                               classify_parallel=_classify_parallel)

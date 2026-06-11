@@ -59,7 +59,7 @@ for i in range(0, len(files)):
 
     # extract initial wood points.
     print(str(datetime.datetime.now()) + ' | >>>extracting initial wood points...')
-    init_wood_ids = extract_init_wood(pcd, G, root_id, path_dis, pred,
+    init_wood_ids, G = extract_init_wood(pcd, G, root_id, path_dis, pred,
                                   split_interval=[0.1, 0.2, 0.3, 0.5, 1], max_angle=0.15*np.pi)
 
     # extract final wood points.

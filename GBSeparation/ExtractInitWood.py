@@ -274,4 +274,7 @@ def extract_init_wood(
 
     init_wood_ids = np.unique(init_wood_ids)
     print(f"Total wood IDs identified: {len(init_wood_ids)}")
-    return init_wood_ids
+    # Return G alongside init_wood_ids so callers always receive the edge-cut
+    # graph. For CSR the cut version is a new object (local rebind inside this
+    # function); for NetworkX G was mutated in-place and is the same object.
+    return init_wood_ids, G
