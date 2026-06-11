@@ -157,7 +157,7 @@ def _make_output_header(las, overwrite):
     ]
     extra_dims.append(laspy.ExtraBytesParams(
         name="foliage_type", type=np.int8,
-        description="1=leaf,0=wood,2=understorey,-1=other"))
+        description="1=leaf,0=wood,2=under,-1=other"))
     new_header.add_extra_dims(extra_dims)
     return new_header
 
