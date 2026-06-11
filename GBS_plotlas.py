@@ -40,7 +40,7 @@ GROUND_CLASS = 2
 _LW_DTYPE = np.int8   # 1=leaf, 0=wood, 2=understorey, -1=other/ground/failed
 SENTINEL = np.int8(-1)
 UNDERSTOREY_VALUE = np.int8(2)
-MIN_COMPONENT_POINTS = 10
+MIN_COMPONENT_POINTS = 100
 _WRITE_CHUNK = 100_000
 VOXEL_SIZE = 0.02     # metres — grid resolution used to downsample each component before GBS
 
@@ -416,12 +416,12 @@ def main():
         if len(understorey_indices):
             non_other[understorey_indices] = False
 
+    n_gbs_comps = sum(1 for idx in groups.values() if len(idx) >= MIN_COMPONENT_POINTS)
     n_veg = int(np.sum(non_other))
     n_ground = int(np.sum(ground_mask))
     n_unclassified = int(np.sum(other_mask)) - n_ground
     n_understorey = len(understorey_indices)
     print("Grouping strategy : %s" % strategy)
-    print("Components        : %d" % len(groups))
     print("Vegetation pts    : %s" % f"{n_veg:,}")
     if n_understorey > 0:
         print("Understorey pts   : %s" % f"{n_understorey:,}")
@@ -484,6 +484,7 @@ def main():
                                  np.full(len(chunk), UNDERSTOREY_VALUE, dtype=_LW_DTYPE), out_fmt)
                     pbar.update(len(chunk))
         del understorey_indices
+        print("Components        : %d" % n_gbs_comps)
 
         n_leaf = n_wood = n_failed = 0
         ctx = Pool(workers, maxtasksperchild=16, initializer=_worker_init) if workers > 1 else nullcontext()
