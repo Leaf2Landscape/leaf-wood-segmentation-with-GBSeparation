@@ -37,8 +37,9 @@ def _available_cpus():
 
 
 GROUND_CLASS = 2
-_LW_DTYPE = np.int8   # 1=leaf, 0=wood, -1=other/ground/failed
+_LW_DTYPE = np.int8   # 1=leaf, 0=wood, 2=understorey, -1=other/ground/failed
 SENTINEL = np.int8(-1)
+UNDERSTOREY_VALUE = np.int8(2)
 MIN_COMPONENT_POINTS = 10
 _WRITE_CHUNK = 100_000
 VOXEL_SIZE = 0.02     # metres — grid resolution used to downsample each component before GBS
@@ -156,7 +157,7 @@ def _make_output_header(las, overwrite):
     ]
     extra_dims.append(laspy.ExtraBytesParams(
         name="foliage_type", type=np.int8,
-        description="1=leaf,0=wood,-1=other"))
+        description="1=leaf,0=wood,2=understorey,-1=other"))
     new_header.add_extra_dims(extra_dims)
     return new_header
 
@@ -336,6 +337,10 @@ def run_dry_run(las, args):
     print("Components found: %d" % len(groups))
     for key in sorted(groups, key=lambda k: str(k)):
         print("  %s: %d points" % (key, len(groups[key])))
+    if strategy == 'component_id':
+        n_tree_comps = sum(1 for idx in groups.values() if np.all(classification[idx] == 5))
+        print("  -> Tree components (classification == 5): %d" % n_tree_comps)
+        print("  -> Understorey components (other): %d" % (len(groups) - n_tree_comps))
 
     print("Ground points (Classification == %d): %d" % (GROUND_CLASS, int(np.sum(ground_mask))))
     n_other = int(np.sum(other_mask & ~ground_mask))
@@ -395,12 +400,31 @@ def main():
     groups = {key: idx[non_other[idx]] for key, idx in groups.items()}
     groups = {key: idx for key, idx in groups.items() if len(idx) > 0}
 
+    # For component_id strategy: only run GBS on tree components (classification == 5).
+    # All others (understorey) are written directly with foliage_type = UNDERSTOREY_VALUE.
+    understorey_indices = np.empty(0, dtype=np.intp)
+    if strategy == 'component_id':
+        tree_groups = {}
+        under_parts = []
+        for key, idx in groups.items():
+            if np.all(classification[idx] == 5):
+                tree_groups[key] = idx
+            else:
+                under_parts.append(idx)
+        understorey_indices = np.concatenate(under_parts) if under_parts else np.empty(0, dtype=np.intp)
+        groups = tree_groups
+        if len(understorey_indices):
+            non_other[understorey_indices] = False
+
     n_veg = int(np.sum(non_other))
     n_ground = int(np.sum(ground_mask))
     n_unclassified = int(np.sum(other_mask)) - n_ground
+    n_understorey = len(understorey_indices)
     print("Grouping strategy : %s" % strategy)
     print("Components        : %d" % len(groups))
     print("Vegetation pts    : %s" % f"{n_veg:,}")
+    if n_understorey > 0:
+        print("Understorey pts   : %s" % f"{n_understorey:,}")
     print("Ground pts        : %s" % f"{n_ground:,}")
     if n_unclassified > 0:
         print("Unclassified pts  : %s" % f"{n_unclassified:,}")
@@ -449,6 +473,18 @@ def main():
                 pbar.update(len(chunk))
         del other_indices
 
+        # Write understorey components directly — no GBS classification.
+        n_under = len(understorey_indices)
+        if n_under:
+            with tqdm(total=n_under, desc="Writing understorey",
+                      unit="pts", unit_scale=True) as pbar:
+                for start in range(0, n_under, _WRITE_CHUNK):
+                    chunk = understorey_indices[start:start + _WRITE_CHUNK]
+                    _write_chunk(writer, las.points, chunk,
+                                 np.full(len(chunk), UNDERSTOREY_VALUE, dtype=_LW_DTYPE), out_fmt)
+                    pbar.update(len(chunk))
+        del understorey_indices
+
         n_leaf = n_wood = n_failed = 0
         ctx = Pool(workers, maxtasksperchild=16, initializer=_worker_init) if workers > 1 else nullcontext()
         with ctx as pool, tqdm(total=len(tasks), desc="Processing components") as pbar:
@@ -456,12 +492,21 @@ def main():
                        if pool is not None else map(_gbs_worker, range(len(tasks))))
             try:
                 for task_id, lw in results:
-                    _, _, _, global_idx = tasks[task_id]
-                    n_leaf += int(np.sum(lw == 1))
-                    n_wood += int(np.sum(lw == 0))
-                    n_failed += int(np.sum(lw == SENTINEL))
-                    pbar.set_postfix(sz=len(lw), leaf=n_leaf, wood=n_wood, skip=n_failed)
+                    _, comp_key, _, global_idx = tasks[task_id]
+                    n_pts = len(lw)
+                    n_leaf_c = int(np.sum(lw == 1))
+                    n_wood_c = int(np.sum(lw == 0))
+                    n_fail_c = int(np.sum(lw == SENTINEL))
+                    n_leaf += n_leaf_c
+                    n_wood += n_wood_c
+                    n_failed += n_fail_c
+                    pbar.set_postfix(sz=n_pts, leaf=n_leaf, wood=n_wood, skip=n_failed)
                     _write_chunk(writer, las.points, global_idx, lw, out_fmt)
+                    if _SILENCE_IO:
+                        pct = int(100 * n_leaf_c / n_pts) if n_pts else 0
+                        suffix = ("  [%d failed]" % n_fail_c) if n_fail_c else ""
+                        tqdm.write("  comp %s: %s pts → leaf=%d%% wood=%s%s"
+                                   % (comp_key, f"{n_pts:,}", pct, f"{n_wood_c:,}", suffix))
                     pbar.update()
             except Exception as exc:
                 print("\nERROR: worker process crashed unexpectedly: %s" % exc)
