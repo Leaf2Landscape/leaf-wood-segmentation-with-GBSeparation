@@ -43,6 +43,7 @@ UNDERSTOREY_VALUE = np.int8(2)
 MIN_COMPONENT_POINTS = 100
 _WRITE_CHUNK = 100_000
 VOXEL_SIZE = 0.02     # metres — grid resolution used to downsample each component before GBS
+DTM_CLEARANCE = 0.2   # metres — points whose height above the --dtm surface is below this are dropped
 
 # Module-level globals shared with worker processes via fork.
 # Set in main() before Pool creation; never written by workers.
@@ -72,6 +73,37 @@ def _silence():
     finally:
         sys.stdout, sys.stderr = old_out, old_err
         devnull.close()
+
+
+def dtm_ground_mask(xyz, dtm_path):
+    """Return a boolean mask (True = within DTM_CLEARANCE of the DTM surface).
+
+    The DTM file (.ply/.las/...) is read as a point/vertex set.  Its surface Z is
+    interpolated at each input point's XY — linearly inside the DTM's convex hull,
+    nearest-neighbour outside it.  Points whose height above the interpolated
+    surface is below DTM_CLEARANCE (including any at or below the surface) are
+    flagged so the caller can exclude them from GBS and write them as -1.
+    """
+    import open3d as o3d
+    from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+
+    pcd = o3d.io.read_point_cloud(dtm_path)
+    dtm = np.asarray(pcd.points)
+    if dtm.size == 0:
+        # Not a point cloud — try reading it as a triangle mesh and use its vertices.
+        dtm = np.asarray(o3d.io.read_triangle_mesh(dtm_path).vertices)
+    if dtm.size == 0:
+        print("Error: DTM file has no points or vertices: %s" % dtm_path)
+        sys.exit(1)
+    print("  DTM loaded: %s surface points." % f"{len(dtm):,}")
+
+    lin = LinearNDInterpolator(dtm[:, :2], dtm[:, 2])
+    surf_z = lin(xyz[:, 0], xyz[:, 1])
+    outside = np.isnan(surf_z)
+    if outside.any():
+        nn = NearestNDInterpolator(dtm[:, :2], dtm[:, 2])
+        surf_z[outside] = nn(xyz[outside, 0], xyz[outside, 1])
+    return (xyz[:, 2] - surf_z) < DTM_CLEARANCE
 
 
 def build_groups(las):
@@ -343,6 +375,11 @@ def run_dry_run(las, args):
         print("  -> Understorey components (other): %d" % (len(groups) - n_tree_comps))
 
     print("Ground points (Classification == %d): %d" % (GROUND_CLASS, int(np.sum(ground_mask))))
+    if args.dtm is not None:
+        xyz = np.vstack((las.x, las.y, las.z)).T.astype(np.float32)
+        dtm_mask = dtm_ground_mask(xyz, args.dtm)
+        print("DTM-filtered points (within %.2f m of %s): %d"
+              % (DTM_CLEARANCE, args.dtm, int(np.sum(dtm_mask & ~ground_mask))))
     n_other = int(np.sum(other_mask & ~ground_mask))
     if n_other:
         print("Other non-vegetation points (component_id <= 0): %d" % n_other)
@@ -355,6 +392,9 @@ def main():
         description="Run GBSeparation leaf/wood classification on a forest-plot .las/.laz file.")
     parser.add_argument("--input_file", required=True, help="path to input .las/.laz")
     parser.add_argument("--output_file", required=True, help="path to output .las/.laz")
+    parser.add_argument("--dtm", default=None,
+                        help="optional DTM ground surface (.ply/.las/...); points within "
+                             "%.2f m of the surface are dropped (written as -1)." % DTM_CLEARANCE)
     parser.add_argument("--dry_run", action="store_true",
                         help="inspect input and exit without writing any files")
     parser.add_argument("--overwrite", action="store_true",
@@ -370,6 +410,10 @@ def main():
 
     if not os.path.isfile(args.input_file):
         print("Error: input file not found or not readable: %s" % args.input_file)
+        sys.exit(1)
+
+    if args.dtm is not None and not os.path.isfile(args.dtm):
+        print("Error: DTM file not found or not readable: %s" % args.dtm)
         sys.exit(1)
 
     file_size_gb = os.path.getsize(args.input_file) / 1e9
@@ -393,9 +437,16 @@ def main():
     classification = np.asarray(las.classification)
     ground_mask = classification == GROUND_CLASS
 
+    dtm_mask = None
+    if args.dtm is not None:
+        print("Filtering points within %.2f m of DTM: %s" % (DTM_CLEARANCE, args.dtm))
+        dtm_mask = dtm_ground_mask(xyz, args.dtm)
+
     groups, strategy, other_mask = build_groups(las)
-    # Ground wins over component membership.
+    # Ground wins over component membership; DTM-near points are dropped likewise.
     other_mask = other_mask | ground_mask
+    if dtm_mask is not None:
+        other_mask = other_mask | dtm_mask
     non_other = ~other_mask
     groups = {key: idx[non_other[idx]] for key, idx in groups.items()}
     groups = {key: idx for key, idx in groups.items() if len(idx) > 0}
@@ -426,6 +477,9 @@ def main():
     if n_understorey > 0:
         print("Understorey pts   : %s" % f"{n_understorey:,}")
     print("Ground pts        : %s" % f"{n_ground:,}")
+    if dtm_mask is not None:
+        n_dtm = int(np.sum(dtm_mask & ~ground_mask))
+        print("DTM-filtered pts  : %s" % f"{n_dtm:,}")
     if n_unclassified > 0:
         print("Unclassified pts  : %s" % f"{n_unclassified:,}")
 
