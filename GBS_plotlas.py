@@ -1,6 +1,7 @@
 import os
 import sys
 import argparse
+import tempfile
 from contextlib import nullcontext, contextmanager
 from multiprocessing import Pool, cpu_count
 import joblib
@@ -42,6 +43,7 @@ SENTINEL = np.int8(-1)
 UNDERSTOREY_VALUE = np.int8(2)
 MIN_COMPONENT_POINTS = 100
 _WRITE_CHUNK = 100_000
+_STREAM_CHUNK = 1_000_000   # points per chunk in the streaming filter pass
 VOXEL_SIZE = 0.02     # metres — grid resolution used to downsample each component before GBS
 DTM_CLEARANCE = 0.2   # metres — points whose height above the --dtm surface is below this are dropped
 
@@ -75,14 +77,11 @@ def _silence():
         devnull.close()
 
 
-def dtm_ground_mask(xyz, dtm_path):
-    """Return a boolean mask (True = within DTM_CLEARANCE of the DTM surface).
+def _build_dtm_interpolators(dtm_path):
+    """Load DTM and build LinearNDInterpolator + NearestNDInterpolator.
 
-    The DTM file (.ply/.las/...) is read as a point/vertex set.  Its surface Z is
-    interpolated at each input point's XY — linearly inside the DTM's convex hull,
-    nearest-neighbour outside it.  Points whose height above the interpolated
-    surface is below DTM_CLEARANCE (including any at or below the surface) are
-    flagged so the caller can exclude them from GBS and write them as -1.
+    Both are built upfront so the streaming pass can query them per chunk
+    without reloading the DTM each time.  Returns (lin, nn).
     """
     import open3d as o3d
     from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
@@ -90,18 +89,37 @@ def dtm_ground_mask(xyz, dtm_path):
     pcd = o3d.io.read_point_cloud(dtm_path)
     dtm = np.asarray(pcd.points)
     if dtm.size == 0:
-        # Not a point cloud — try reading it as a triangle mesh and use its vertices.
         dtm = np.asarray(o3d.io.read_triangle_mesh(dtm_path).vertices)
     if dtm.size == 0:
         print("Error: DTM file has no points or vertices: %s" % dtm_path)
         sys.exit(1)
     print("  DTM loaded: %s surface points." % f"{len(dtm):,}")
-
     lin = LinearNDInterpolator(dtm[:, :2], dtm[:, 2])
+    nn  = NearestNDInterpolator(dtm[:, :2], dtm[:, 2])
+    return lin, nn
+
+
+def _apply_dtm_mask_chunk(dtm_interps, x, y, z):
+    """Return boolean mask (True = within DTM_CLEARANCE of the surface) for one chunk."""
+    lin, nn = dtm_interps
+    surf_z = lin(x, y)
+    outside = np.isnan(surf_z)
+    if outside.any():
+        surf_z[outside] = nn(x[outside], y[outside])
+    return (z - surf_z) < DTM_CLEARANCE
+
+
+def dtm_ground_mask(xyz, dtm_path):
+    """Return a boolean mask (True = within DTM_CLEARANCE of the DTM surface).
+
+    Used only by run_dry_run (which already holds the full xyz in memory).
+    The main pipeline uses _build_dtm_interpolators + _apply_dtm_mask_chunk
+    instead, to avoid loading 148 M query points into a single interpolation call.
+    """
+    lin, nn = _build_dtm_interpolators(dtm_path)
     surf_z = lin(xyz[:, 0], xyz[:, 1])
     outside = np.isnan(surf_z)
     if outside.any():
-        nn = NearestNDInterpolator(dtm[:, :2], dtm[:, 2])
         surf_z[outside] = nn(xyz[outside, 0], xyz[outside, 1])
     return (xyz[:, 2] - surf_z) < DTM_CLEARANCE
 
@@ -167,9 +185,13 @@ def build_groups(las):
     sys.exit(1)
 
 
-def _make_output_header(las, overwrite):
-    """Build output LasHeader with foliage_type (int8) extra dim."""
-    dim_names = [dim.name for dim in las.point_format.dimensions]
+def _make_output_header(source_header, source_pf, overwrite):
+    """Build output LasHeader with foliage_type (int8) extra dim.
+
+    Accepts the source LasHeader and its PointFormat separately so callers
+    can supply them from either a LasData object or a LasReader.
+    """
+    dim_names = [dim.name for dim in source_pf.dimensions]
     if 'foliage_type' in dim_names and not overwrite:
         print("Error: 'foliage_type' dimension already exists. Use --overwrite to replace it.")
         sys.exit(1)
@@ -177,20 +199,43 @@ def _make_output_header(las, overwrite):
     # Use the integer format ID so LasHeader gets its own fresh PointFormat object
     # rather than sharing (and mutating) the source's PointFormat via object reference.
     new_header = laspy.LasHeader(
-        point_format=las.header.point_format.id,
-        version=las.header.version,
+        point_format=source_header.point_format.id,
+        version=source_header.version,
     )
-    new_header.offsets = las.header.offsets
-    new_header.scales = las.header.scales
+    new_header.offsets = source_header.offsets
+    new_header.scales = source_header.scales
     extra_dims = [
         laspy.ExtraBytesParams(name=d.name, type=d.dtype)
-        for d in las.point_format.extra_dimensions
+        for d in source_pf.extra_dimensions
         if d.name != 'foliage_type'
     ]
     extra_dims.append(laspy.ExtraBytesParams(
         name="foliage_type", type=np.int8,
         description="1=leaf,0=wood,2=under,-1=other"))
     new_header.add_extra_dims(extra_dims)
+    return new_header
+
+
+def _make_temp_header(source_header, source_pf):
+    """Build a LasHeader for the streaming-filter temp file.
+
+    Same format as the input (preserving component_id, classification, etc.)
+    but without adding foliage_type — the temp file is an intermediate that
+    the GBS phase reads; foliage_type is written to the final output.
+    """
+    new_header = laspy.LasHeader(
+        point_format=source_header.point_format.id,
+        version=source_header.version,
+    )
+    new_header.offsets = source_header.offsets
+    new_header.scales = source_header.scales
+    extra_dims = [
+        laspy.ExtraBytesParams(name=d.name, type=d.dtype)
+        for d in source_pf.extra_dimensions
+        if d.name != 'foliage_type'
+    ]
+    if extra_dims:
+        new_header.add_extra_dims(extra_dims)
     return new_header
 
 
@@ -206,6 +251,21 @@ def _write_chunk(writer, src_points, indices, lw_values, out_fmt):
             buf[name] = src_raw[name]
     buf['foliage_type'] = lw_values
     writer.write_points(laspy.PackedPointRecord(buf, out_fmt))
+
+
+def _copy_chunk(writer, src_chunk, indices, dest_fmt):
+    """Copy a subset of src_chunk to writer using dest_fmt field matching.
+
+    Like _write_chunk but does not write foliage_type — used to populate the
+    temp file during the streaming filter pass.
+    """
+    sub = src_chunk[indices]
+    buf = np.zeros(len(indices), dtype=dest_fmt.dtype())
+    src_raw = sub.array
+    for name in src_raw.dtype.names:
+        if name in buf.dtype.names:
+            buf[name] = src_raw[name]
+    writer.write_points(laspy.PackedPointRecord(buf, dest_fmt))
 
 
 def _voxel_downsample(xyz, voxel_size):
@@ -259,94 +319,57 @@ def _gbs_worker(task_idx):
     """
     Worker entry point for both sequential and multiprocessing execution.
     Reads _VEG_XYZ, _TASK_LIST, _THREADS_PER_WORKER, _SILENCE_IO from module globals
-    (set in main() before any Pool is created; inherited via fork on Linux).
-    Returns (task_id, foliage_type); caller looks up global_idx via _TASK_LIST[task_id].
+    set in main() before any Pool is created.
     """
-    task_id, comp_key, local_idx, _ = _TASK_LIST[task_idx]
+    import traceback as _tb
+    task_id, comp_key, local_idx, global_idx = _TASK_LIST[task_idx]
     n_pts = len(local_idx)
     if n_pts < MIN_COMPONENT_POINTS:
-        print("Warning: component %s with %d points (< %d) skipped."
-              % (comp_key, n_pts, MIN_COMPONENT_POINTS))
         return task_id, np.full(n_pts, SENTINEL, dtype=_LW_DTYPE)
     try:
-        xyz_comp = _VEG_XYZ[local_idx].astype(np.float32)
+        ctx = _silence() if _SILENCE_IO else nullcontext()
+        with ctx:
+            if _THREADS_PER_WORKER > 0:
+                threadpoolctl.threadpool_limits(limits=_THREADS_PER_WORKER, user_api='blas')
+            xyz_comp = _VEG_XYZ[local_idx].astype(np.float32)
 
-        # Downsample to VOXEL_SIZE grid; voxel_assignment maps every original
-        # point back to its representative's label after classification.
-        rep_indices, voxel_assignment = _voxel_downsample(xyz_comp, VOXEL_SIZE)
-        if len(rep_indices) >= 30:
-            # Normal path: classify the downsampled cloud, map labels back via voxel assignment.
-            xyz_sub = xyz_comp[rep_indices]
-            use_voxel = True
-        elif n_pts >= 30:
-            # Downsampled cloud is too sparse for knn=30 but the original has enough points.
-            # Classify the original directly; labels map 1-to-1, no voxel assignment needed.
-            print("Warning: component %s downsampled to %d pts (< knn=30); "
-                  "classifying %d original pts instead." % (comp_key, len(rep_indices), n_pts))
-            xyz_sub = xyz_comp
-            use_voxel = False
-        else:
-            print("Warning: component %s %d pts (< knn=30) — skipped." % (comp_key, n_pts))
-            return task_id, np.full(n_pts, SENTINEL, dtype=_LW_DTYPE)
-
-        # Use the largest spatial dimension (X, Y, or Z) to derive graph thresholds.
-        # Using only Z (height) gives near-zero thresholds for flat/horizontal structures,
-        # making array_to_graph's bridging loop iterate hundreds of thousands of times.
-        treeHeight = float((np.max(xyz_sub, axis=0) - np.min(xyz_sub, axis=0)).max())
-        root, _ = getRootPt(xyz_sub, lower_h=0.0, upper_h=0.2)
-        # circleFit degenerates (divide-by-zero) when the low-height slice points
-        # are collinear; fall back to the XY centroid of the slice in that case.
-        if not np.isfinite(root).all():
-            low_mask = xyz_sub[:, 2] < (xyz_sub[:, 2].min() + 0.2)
-            src = xyz_sub[low_mask] if low_mask.any() else xyz_sub
-            root = np.array([[src[:, 0].mean(), src[:, 1].mean(),
-                               float(xyz_sub[:, 2].min())]], dtype=np.float32)
-        xyz_sub = np.append(xyz_sub, root, axis=0)
-        root_id = xyz_sub.shape[0] - 1
-        n_vox = len(xyz_sub) - 1  # -1 to exclude root point
-        # Silence library stdout/stderr in parallel workers to prevent blocked
-        # terminal writes from hanging the worker before it can return its result.
-        _io_ctx = _silence() if _SILENCE_IO else nullcontext()
-        with _io_ctx:
-            print("  comp %s: %d pts → %d voxels" % (comp_key, n_pts, n_vox), flush=True)
-            if _THREADS_PER_WORKER == -1:
-                # Sequential path: bare call, all cores via sklearn default.
-                G = array_to_graph(xyz_sub, root_id, kpairs=3, knn=30,
-                                   nbrs_threshold=treeHeight / 30,
-                                   nbrs_threshold_step=treeHeight / 60,
-                                   n_jobs=-1)
+            rep_indices, voxel_assignment = _voxel_downsample(xyz_comp, VOXEL_SIZE)
+            if len(rep_indices) >= MIN_COMPONENT_POINTS:
+                xyz_sub = xyz_comp[rep_indices]
             else:
-                # Multi-process path: joblib threading backend avoids the loky
-                # restriction on spawning sub-processes inside forked workers.
-                with joblib.parallel_backend('threading', n_jobs=_THREADS_PER_WORKER):
-                    G = array_to_graph(xyz_sub, root_id, kpairs=3, knn=30,
-                                       nbrs_threshold=treeHeight / 30,
-                                       nbrs_threshold_step=treeHeight / 60,
-                                       n_jobs=_THREADS_PER_WORKER)
+                xyz_sub = xyz_comp
+
+            treeHeight = float((np.max(xyz_sub, axis=0) - np.min(xyz_sub, axis=0)).max())
+            root, _ = getRootPt(xyz_sub, lower_h=0.0, upper_h=0.2)
+            if root is None:
+                low_mask = xyz_sub[:, 2] < (xyz_sub[:, 2].min() + 0.2)
+                src = xyz_sub[low_mask] if low_mask.any() else xyz_sub
+                root = np.array([[float(src[:, 0].mean()),
+                                   float(src[:, 1].mean()),
+                                   float(xyz_sub[:, 2].min())]], dtype=np.float32)
+            xyz_sub = np.append(xyz_sub, root, axis=0)
+            root_id = xyz_sub.shape[0] - 1
+            n_vox = len(xyz_sub) - 1  # -1 to exclude root point
+
+            G = array_to_graph(xyz_sub, root_id, kpairs=3, knn=30,
+                               nbrs_threshold=0.15,
+                               nbrs_threshold_step=0.05)
             path_dis, pred = extract_path_info(G, root_id, return_path=True)
-            # Only enable intra-worker threading on the sequential path.
-            # When workers > 1, each forked worker spawning a ThreadPoolExecutor
-            # that calls np.linalg.svd causes BLAS deadlocks: multiple processes
-            # contend on the same BLAS internal thread pool simultaneously.
-            # The process pool already provides outer parallelism; inner threading
-            # for this step is not worth the deadlock risk.
-            _classify_parallel = _THREADS_PER_WORKER == -1
+
             init_wood_ids, G = extract_init_wood(xyz_sub, G, root_id, path_dis, pred,
-                                              split_interval=[0.1, 0.2, 0.3, 0.5, 1],
-                                              max_angle=0.15 * np.pi,
-                                              classify_parallel=_classify_parallel)
+                                                 split_interval=[0.1, 0.2, 0.3, 0.5, 1],
+                                                 max_angle=0.15 * np.pi)
             final_wood_mask = extract_final_wood(xyz_sub, root_id, path_dis, pred,
                                                  init_wood_ids, G)
-        final_wood_mask[-1] = False
-        # pipeline: True=wood; output: 1=leaf, 0=wood
-        rep_labels = (~final_wood_mask[:-1]).astype(_LW_DTYPE)
+            final_wood_mask = final_wood_mask[:n_vox]  # drop the appended root
 
-        foliage_type = rep_labels[voxel_assignment] if use_voxel else rep_labels
-        return task_id, foliage_type
+            if len(rep_indices) >= MIN_COMPONENT_POINTS:
+                lw = np.where(final_wood_mask[voxel_assignment], 0, 1).astype(_LW_DTYPE)
+            else:
+                lw = np.where(final_wood_mask, 0, 1).astype(_LW_DTYPE)
+            return task_id, lw
     except Exception as exc:
-        import traceback as _tb
-        # Capture the full traceback as a string and emit it as a single
-        # tqdm.write() call so it is not overwritten by the parent's tqdm
+        # Write to tqdm so error appears below the
         # progress bar (which uses carriage-return and would stomp a
         # multi-line traceback written directly to the shared terminal fd).
         tb_str = _tb.format_exc().rstrip()
@@ -387,66 +410,15 @@ def run_dry_run(las, args):
     sys.exit(0)
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Run GBSeparation leaf/wood classification on a forest-plot .las/.laz file.")
-    parser.add_argument("--input_file", required=True, help="path to input .las/.laz")
-    parser.add_argument("--output_file", required=True, help="path to output .las/.laz")
-    parser.add_argument("--dtm", default=None,
-                        help="optional DTM ground surface (.ply/.las/...); points within "
-                             "%.2f m of the surface are dropped (written as -1)." % DTM_CLEARANCE)
-    parser.add_argument("--dry_run", action="store_true",
-                        help="inspect input and exit without writing any files")
-    parser.add_argument("--overwrite", action="store_true",
-                        help="overwrite the 'foliage_type' dimension if it already exists in the input")
-    parser.add_argument("--workers", type=int, default=1,
-                        help="number of components to classify in parallel (default: 1). "
-                             "Requires Linux/WSL (uses fork). Recommended: 2–4.")
-    parser.add_argument("--threads", type=int, default=0,
-                        help="threads per worker for KNN and component classification "
-                             "(default: 0 = auto: cpu_count()//workers). "
-                             "Has no effect when --workers 1.")
-    args = parser.parse_args()
-
-    if not os.path.isfile(args.input_file):
-        print("Error: input file not found or not readable: %s" % args.input_file)
-        sys.exit(1)
-
-    if args.dtm is not None and not os.path.isfile(args.dtm):
-        print("Error: DTM file not found or not readable: %s" % args.dtm)
-        sys.exit(1)
-
-    file_size_gb = os.path.getsize(args.input_file) / 1e9
-    print("Reading %.2f GB: %s" % (file_size_gb, args.input_file))
-    try:
-        las = laspy.read(args.input_file)
-    except Exception as exc:
-        print("Error: could not read input file: %s" % exc)
-        sys.exit(1)
-    n_pts = len(las.x)
-    print("  Loaded %s points." % f"{n_pts:,}")
-
-    if args.dry_run:
-        run_dry_run(las, args)
-
-    new_header = _make_output_header(las, args.overwrite)
-    out_fmt = new_header.point_format
-
-    print("Extracting XYZ coordinates ...")
-    xyz = np.vstack((las.x, las.y, las.z)).T.astype(np.float32)
+def _run_gbs_pipeline(las, args, writer, out_fmt):
+    """Run GBS classification on already-filtered las data, writing results to writer."""
     classification = np.asarray(las.classification)
+    # Ground points were removed in the streaming pass; ground_mask is kept for
+    # structural compatibility with the understorey / other separation logic.
     ground_mask = classification == GROUND_CLASS
 
-    dtm_mask = None
-    if args.dtm is not None:
-        print("Filtering points within %.2f m of DTM: %s" % (DTM_CLEARANCE, args.dtm))
-        dtm_mask = dtm_ground_mask(xyz, args.dtm)
-
     groups, strategy, other_mask = build_groups(las)
-    # Ground wins over component membership; DTM-near points are dropped likewise.
     other_mask = other_mask | ground_mask
-    if dtm_mask is not None:
-        other_mask = other_mask | dtm_mask
     non_other = ~other_mask
     groups = {key: idx[non_other[idx]] for key, idx in groups.items()}
     groups = {key: idx for key, idx in groups.items() if len(idx) > 0}
@@ -476,10 +448,6 @@ def main():
     print("Vegetation pts    : %s" % f"{n_veg:,}")
     if n_understorey > 0:
         print("Understorey pts   : %s" % f"{n_understorey:,}")
-    print("Ground pts        : %s" % f"{n_ground:,}")
-    if dtm_mask is not None:
-        n_dtm = int(np.sum(dtm_mask & ~ground_mask))
-        print("DTM-filtered pts  : %s" % f"{n_dtm:,}")
     if n_unclassified > 0:
         print("Unclassified pts  : %s" % f"{n_unclassified:,}")
 
@@ -493,6 +461,7 @@ def main():
     # Avoids a ~3 GB veg_points copy later by keeping las.points (already loaded)
     # and writing via original global indices instead.
     print("Extracting vegetation coordinates (%s pts) ..." % f"{len(non_other_indices):,}")
+    xyz = np.vstack((las.x, las.y, las.z)).T.astype(np.float32)
     veg_xyz = xyz[non_other_indices]
     del xyz, other_mask, non_other
 
@@ -514,64 +483,202 @@ def main():
         print("Parallel mode: %d workers, %d threads/worker" % (workers, _THREADS_PER_WORKER))
     # workers == 1: _THREADS_PER_WORKER stays -1; sequential path is unchanged.
 
-    with open(args.output_file, "wb") as _out_fh, \
-         laspy.LasWriter(_out_fh, header=new_header) as writer:
-        # Stream non-classified points in chunks.
-        n_other = len(other_indices)
-        with tqdm(total=n_other, desc="Writing non-classified",
+    # Stream non-classified points in chunks.
+    n_other = len(other_indices)
+    with tqdm(total=n_other, desc="Writing non-classified",
+              unit="pts", unit_scale=True) as pbar:
+        for start in range(0, n_other, _WRITE_CHUNK):
+            chunk = other_indices[start:start + _WRITE_CHUNK]
+            _write_chunk(writer, las.points, chunk,
+                         np.full(len(chunk), SENTINEL, dtype=_LW_DTYPE), out_fmt)
+            pbar.update(len(chunk))
+    del other_indices
+
+    # Write understorey components directly — no GBS classification.
+    n_under = len(understorey_indices)
+    if n_under:
+        with tqdm(total=n_under, desc="Writing understorey",
                   unit="pts", unit_scale=True) as pbar:
-            for start in range(0, n_other, _WRITE_CHUNK):
-                chunk = other_indices[start:start + _WRITE_CHUNK]
+            for start in range(0, n_under, _WRITE_CHUNK):
+                chunk = understorey_indices[start:start + _WRITE_CHUNK]
                 _write_chunk(writer, las.points, chunk,
-                             np.full(len(chunk), SENTINEL, dtype=_LW_DTYPE), out_fmt)
+                             np.full(len(chunk), UNDERSTOREY_VALUE, dtype=_LW_DTYPE), out_fmt)
                 pbar.update(len(chunk))
-        del other_indices
+    del understorey_indices
+    print("Components        : %d" % n_gbs_comps)
 
-        # Write understorey components directly — no GBS classification.
-        n_under = len(understorey_indices)
-        if n_under:
-            with tqdm(total=n_under, desc="Writing understorey",
-                      unit="pts", unit_scale=True) as pbar:
-                for start in range(0, n_under, _WRITE_CHUNK):
-                    chunk = understorey_indices[start:start + _WRITE_CHUNK]
-                    _write_chunk(writer, las.points, chunk,
-                                 np.full(len(chunk), UNDERSTOREY_VALUE, dtype=_LW_DTYPE), out_fmt)
-                    pbar.update(len(chunk))
-        del understorey_indices
-        print("Components        : %d" % n_gbs_comps)
-
-        n_leaf = n_wood = n_failed = 0
-        ctx = Pool(workers, maxtasksperchild=16, initializer=_worker_init) if workers > 1 else nullcontext()
-        with ctx as pool, tqdm(total=len(tasks), desc="Processing components") as pbar:
-            results = (pool.imap_unordered(_gbs_worker, range(len(tasks)))
-                       if pool is not None else map(_gbs_worker, range(len(tasks))))
-            try:
-                for task_id, lw in results:
-                    _, comp_key, _, global_idx = tasks[task_id]
-                    n_pts = len(lw)
-                    n_leaf_c = int(np.sum(lw == 1))
-                    n_wood_c = int(np.sum(lw == 0))
-                    n_fail_c = int(np.sum(lw == SENTINEL))
-                    n_leaf += n_leaf_c
-                    n_wood += n_wood_c
-                    n_failed += n_fail_c
-                    pbar.set_postfix(sz=n_pts, leaf=n_leaf, wood=n_wood, skip=n_failed)
-                    _write_chunk(writer, las.points, global_idx, lw, out_fmt)
-                    if _SILENCE_IO:
-                        pct = int(100 * n_leaf_c / n_pts) if n_pts else 0
-                        suffix = ("  [%d failed]" % n_fail_c) if n_fail_c else ""
-                        tqdm.write("  comp %s: %s pts → leaf=%d%% wood=%s%s"
-                                   % (comp_key, f"{n_pts:,}", pct, f"{n_wood_c:,}", suffix))
-                    pbar.update()
-            except Exception as exc:
-                print("\nERROR: worker process crashed unexpectedly: %s" % exc)
-                print("Output written up to this point; remaining components unclassified.")
+    n_leaf = n_wood = n_failed = 0
+    ctx = Pool(workers, maxtasksperchild=16, initializer=_worker_init) if workers > 1 else nullcontext()
+    with ctx as pool, tqdm(total=len(tasks), desc="Processing components") as pbar:
+        results = (pool.imap_unordered(_gbs_worker, range(len(tasks)))
+                   if pool is not None else map(_gbs_worker, range(len(tasks))))
+        try:
+            for task_id, lw in results:
+                _, comp_key, _, global_idx = tasks[task_id]
+                n_pts = len(lw)
+                n_leaf_c = int(np.sum(lw == 1))
+                n_wood_c = int(np.sum(lw == 0))
+                n_fail_c = int(np.sum(lw == SENTINEL))
+                n_leaf += n_leaf_c
+                n_wood += n_wood_c
+                n_failed += n_fail_c
+                pbar.set_postfix(sz=n_pts, leaf=n_leaf, wood=n_wood, skip=n_failed)
+                _write_chunk(writer, las.points, global_idx, lw, out_fmt)
+                if _SILENCE_IO:
+                    pct = int(100 * n_leaf_c / n_pts) if n_pts else 0
+                    suffix = ("  [%d failed]" % n_fail_c) if n_fail_c else ""
+                    tqdm.write("  comp %s: %s pts → leaf=%d%% wood=%s%s"
+                               % (comp_key, f"{n_pts:,}", pct, f"{n_wood_c:,}", suffix))
+                pbar.update()
+        except Exception as exc:
+            print("\nERROR: worker process crashed unexpectedly: %s" % exc)
+            print("Output written up to this point; remaining components unclassified.")
 
     print("Done.")
     print("  Leaf pts  : %s" % f"{n_leaf:,}")
     print("  Wood pts  : %s" % f"{n_wood:,}")
     if n_failed:
         print("  Skipped   : %s" % f"{n_failed:,}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run GBSeparation leaf/wood classification on a forest-plot .las/.laz file.")
+    parser.add_argument("--input_file", required=True, help="path to input .las/.laz")
+    parser.add_argument("--output_file", required=True, help="path to output .las/.laz")
+    parser.add_argument("--dtm", default=None,
+                        help="optional DTM ground surface (.ply/.las/...); points within "
+                             "%.2f m of the surface are dropped (written as -1)." % DTM_CLEARANCE)
+    parser.add_argument("--dry_run", action="store_true",
+                        help="inspect input and exit without writing any files")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="overwrite the 'foliage_type' dimension if it already exists in the input")
+    parser.add_argument("--workers", type=int, default=1,
+                        help="number of components to classify in parallel (default: 1). "
+                             "Requires Linux/WSL (uses fork). Recommended: 2–4.")
+    parser.add_argument("--threads", type=int, default=0,
+                        help="threads per worker for KNN and component classification "
+                             "(default: 0 = auto: cpu_count()//workers). "
+                             "Has no effect when --workers 1.")
+    args = parser.parse_args()
+
+    if not os.path.isfile(args.input_file):
+        print("Error: input file not found or not readable: %s" % args.input_file)
+        sys.exit(1)
+
+    if args.dtm is not None and not os.path.isfile(args.dtm):
+        print("Error: DTM file not found or not readable: %s" % args.dtm)
+        sys.exit(1)
+
+    # Build DTM interpolators upfront: one triangulation over the ~1.8 M DTM
+    # vertices, queried once per streaming chunk rather than over all 148 M
+    # input points in a single call.
+    dtm_interps = None
+    if args.dtm is not None:
+        print("Filtering points within %.2f m of DTM: %s" % (DTM_CLEARANCE, args.dtm))
+        dtm_interps = _build_dtm_interpolators(args.dtm)
+
+    file_size_gb = os.path.getsize(args.input_file) / 1e9
+    print("Reading %.2f GB: %s" % (file_size_gb, args.input_file))
+
+    if args.dry_run:
+        try:
+            las = laspy.read(args.input_file)
+        except Exception as exc:
+            print("Error: could not read input file: %s" % exc)
+            sys.exit(1)
+        print("  Loaded %s points." % f"{len(las.x):,}")
+        run_dry_run(las, args)
+
+    # Read just the file header (no point data) to build output and temp formats.
+    try:
+        with laspy.LasReader(open(args.input_file, 'rb')) as hdr_reader:
+            src_header = hdr_reader.header
+            src_pf     = hdr_reader.header.point_format
+            n_pts_total = src_header.point_count
+            new_header  = _make_output_header(src_header, src_pf, args.overwrite)
+            temp_header = _make_temp_header(src_header, src_pf)
+    except Exception as exc:
+        print("Error: could not read input file: %s" % exc)
+        sys.exit(1)
+
+    out_fmt  = new_header.point_format
+    temp_fmt = temp_header.point_format
+
+    # Temp file holds surviving (non-ground, non-DTM) points for the GBS phase.
+    temp_fd, temp_path = tempfile.mkstemp(suffix='.las', prefix='gbs_filter_')
+    os.close(temp_fd)
+    n_ground = n_dtm = n_surviving = 0
+
+    try:
+        with open(args.output_file, "wb") as out_fh, \
+             laspy.LasWriter(out_fh, header=new_header) as writer:
+
+            # ── Phase 1: streaming filter ─────────────────────────────────────
+            # Stream the input in _STREAM_CHUNK-point chunks.  For each chunk:
+            #   • ground + DTM-near points  → written to output immediately as SENTINEL
+            #   • surviving points          → written to temp file for the GBS phase
+            # Peak memory during this phase: O(_STREAM_CHUNK), not O(all points).
+            print("Streaming %s pts in %s-pt chunks ..."
+                  % (f"{n_pts_total:,}" if n_pts_total else "?",
+                     f"{_STREAM_CHUNK:,}"))
+            with laspy.LasReader(open(args.input_file, 'rb')) as reader, \
+                 open(temp_path, 'wb') as temp_fh, \
+                 laspy.LasWriter(temp_fh, header=temp_header) as temp_writer:
+
+                tqdm_total = n_pts_total if n_pts_total > 0 else None
+                with tqdm(total=tqdm_total, desc="Filtering",
+                          unit="pts", unit_scale=True) as pbar:
+                    for chunk in reader.chunk_iterator(_STREAM_CHUNK):
+                        x   = np.asarray(chunk.x,              dtype=np.float64)
+                        y   = np.asarray(chunk.y,              dtype=np.float64)
+                        z   = np.asarray(chunk.z,              dtype=np.float64)
+                        cls = np.asarray(chunk.classification,  dtype=np.uint8)
+
+                        gnd      = cls == GROUND_CLASS
+                        dtm_near = (_apply_dtm_mask_chunk(dtm_interps, x, y, z)
+                                    if dtm_interps is not None
+                                    else np.zeros(len(x), dtype=bool))
+                        drop = gnd | dtm_near
+
+                        n_ground   += int(gnd.sum())
+                        n_dtm      += int((dtm_near & ~gnd).sum())
+                        n_surviving += int((~drop).sum())
+
+                        drop_idx = np.where(drop)[0]
+                        if len(drop_idx):
+                            _write_chunk(writer, chunk, drop_idx,
+                                         np.full(len(drop_idx), SENTINEL, dtype=_LW_DTYPE),
+                                         out_fmt)
+
+                        keep_idx = np.where(~drop)[0]
+                        if len(keep_idx):
+                            _copy_chunk(temp_writer, chunk, keep_idx, temp_fmt)
+
+                        pbar.update(len(x))
+
+            print("Ground pts        : %s" % f"{n_ground:,}")
+            if dtm_interps is not None:
+                print("DTM-filtered pts  : %s" % f"{n_dtm:,}")
+            print("Surviving pts     : %s" % f"{n_surviving:,}")
+
+            # ── Phase 2: GBS classification ───────────────────────────────────
+            # Load only the surviving (vegetation) points — much smaller than
+            # the original file — and run the full GBS pipeline on them.
+            print("Loading filtered points (%s pts) ..." % f"{n_surviving:,}")
+            try:
+                las = laspy.read(temp_path)
+            except Exception as exc:
+                print("Error: could not read temp file: %s" % exc)
+                raise
+            print("  Loaded %s points." % f"{len(las.x):,}")
+
+            _run_gbs_pipeline(las, args, writer, out_fmt)
+
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
     print("Output: %s" % args.output_file)
 
 
